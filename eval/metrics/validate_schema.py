@@ -65,9 +65,9 @@ def _load_anchor_baseline():
         with open(cfg_path, encoding="utf-8") as f:
             cfg = json.load(f)
         return int(cfg["unit_price_cents"]), int(cfg["quantity"]), int(cfg["expected_total_cents"])
-    except Exception:
-        # 兜底＝与配置源 2026-10-11 基线同值（Q7 假设值；回填后必须以配置源为准，禁此处漂移）
-        return 2999900, 3, 8049700
+    except Exception as exc:
+        # 单源原则：配置读取失败即致命（静默回退旧基线＝Gate5 假绿，复核 N3）
+        raise SystemExit(f"[ERR] pricing_baseline.json 锚点读取失败（单源要求，禁兜底漂移）: {exc}")
 
 
 ANCHOR_UNIT, ANCHOR_QTY, ANCHOR_TOTAL_CENTS = _load_anchor_baseline()  # DD-8.1 示例链：3×¥29,999→9折→−¥500

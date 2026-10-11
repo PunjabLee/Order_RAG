@@ -86,6 +86,12 @@ class TestCommitMsg(unittest.TestCase):
             "docs(plan): 回写\n\nTask: IT-1.11\nTask: IT-1.09\n", commit="28d00011234")
         self.assertEqual(errors, [])  # 历史豁免登记追认
 
+    def test_literal_task_in_body_not_counted(self):
+        # 行首锚定（复核 N4）：正文提及字面 "Task:" 不误拒，仅行首 trailer 计数
+        self.assert_ok(
+            "feat(chat): 注释说明\n\n正文提及旧规则 Task: 相\u5173关键字已修复。\n"
+            "Task: IT-1.11\nRefs: DD-7\n")
+
 
 class TestMermaid(unittest.TestCase):
     def scan(self, text):

@@ -1,7 +1,7 @@
 # IT-1.11 · CI 基线流水线（七步卡口：骨架四步 + 评审修复补齐 Gate 5~7）
 #
 # 平台说明：本文件为 GitHub Actions 语法。若实际平台为 GitLab CI / Jenkins，
-# 请保持同名四步的等价阶段（返回码非 0 即阻断），并更新本注释（scripts/ci/README.md §与流水线的关系）。
+# 请保持同名七步的等价阶段（返回码非 0 即阻断），并更新本注释（scripts/ci/README.md §与流水线的关系）。
 # 分支保护联动：《研发迭代计划.md》§8.2 —— develop 合入需 "1 Approve + CI 绿"，
 # 本流水线即该"CI 绿"的最小定义。
 name: ci
@@ -65,7 +65,7 @@ jobs:
       - name: Gate 6 · OpenAPI lint (redocly)
         run: |
           # errors-dict.yaml 非 OpenAPI 规格（号段叙述字典），不进 redocly 清单，单独做 YAML 语法校验
-          npx --yes @redocly/cli lint \
+          npx --yes @redocly/cli lint --config contracts/redocly.yaml \
             contracts/chat-v1.yaml contracts/orders-v1.yaml contracts/sessions-v1.yaml \
             contracts/feedback-v1.yaml contracts/escalate-v1.yaml contracts/notifications-v1.yaml \
             contracts/shared-schemas.yaml

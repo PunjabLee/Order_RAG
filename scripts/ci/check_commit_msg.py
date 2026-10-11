@@ -160,7 +160,8 @@ def validate_message(text: str, commit: str | None = None) -> tuple[list[str], l
             )
         else:
             warnings.append("Task: N/A 经 Baseline trailer/历史豁免登记放行，请确认确属基线序列提交")
-    if body.count("Task:") > 1 and not legacy:
+    # 行首锚定计数，正文/标题提及字面 "Task:" 不误拒（复核 N4）
+    if len(re.findall(r"^Task:", body, re.M)) > 1 and not legacy:
         errors.append(
             "出现多条 `Task:` trailer：一任务一提交，跨任务请拆分（§8.3 ④，已升级为拒绝，评审 M-4）"
         )

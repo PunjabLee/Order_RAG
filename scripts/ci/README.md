@@ -1,6 +1,6 @@
 # scripts/ci — CI 工程骨架（IT-1.11）
 
-流水线四步卡口的本地实现与运行方法。权威依据：《研发迭代计划.md》§8.2/§8.3/§8.4、
+流水线七步卡口的本地实现与运行方法。权威依据：《研发迭代计划.md》§8.2/§8.3/§8.4、
 《设计文档.md》DD-13（测试分层）、附录 D（mermaid 渲染检查 L-3）、DD-8（金额规范）。
 
 ## 脚本清单
@@ -19,26 +19,32 @@
 ## commit-msg 规则与豁免白名单
 
 必过条件：`<type>(<scope>): <描述>`（type ∈ feat/fix/docs/refactor/test/ci/chore/perf/build，§8.3）
-＋ 正文含 `Task: IT-<数字>.<数字>`（允许尾注 `[Qn]`）＋ 标题与正文之间空一行。返回码非 0 即拒绝。
+＋ 正文含行首 `Task: IT-<数字>.<数字>`（允许尾注 `[Qn]`；行首多于一行 `Task:` 即拒绝，正文/标题提及
+字面 "Task:" 不计，§8.3 硬约束④升级）＋ 标题与正文之间空一行。返回码非 0 即拒绝。
 
 豁免白名单（代码内注释同步列出理由）：
 
 1. **`Merge` / `Revert` 前缀**：平台/`git revert` 机器生成，非人工撰写；合入 squash（§8.3④）
    后主线不保留 Merge 提交。
 2. **`fixup!` / `squash!` 前缀**：交互压缩中间态提交，压缩后的最终提交信息仍受本规则约束。
-3. **`Task: N/A: <理由>`**：仅限**初始 docs 基线**类提交（v2.2-baseline 文档先于任务卡体系产生，
-   无法回溯任务 ID）；必须同行或正文 `Reason:` 写明理由，否则拒绝。
+3. **`Task: N/A: <理由>` + `Baseline: <tag|hash>`**（白名单收敛，评审 M-4/复核 N5）：仅限基线序列
+   遗留提交（v2.2-baseline 文档先于任务卡体系产生）；须同时写明理由与显式 `Baseline:` 尾注，缺一拒绝。
+   CI 范围模式另认历史豁免登记表 `LEGACY_EXEMPT_COMMITS`（90d894c/942367c/28d0001，收敛规则前提交追认）。
 
-宽松项（告警不阻断）：scope 不在 §8.3 业务枚举内（计划暂未定义 infra 类 scope，见交付报告
-"发现与建议"）；缺 `Refs:`；标题超长；多条 `Task:`。
+宽松项（告警不阻断）：scope 不在 §8.3 业务枚举内（计划暂未定义 infra 类 scope，见台账 L-03）；
+缺 `Refs:`；标题超长。（多条 `Task:` 已由告警升级为拒绝，不再列入本节）
 
-## 快速自检（四连跑）
+## 快速自检（七连跑；Gate 6 需 node/npm，Gate 7 需本地 docker daemon）
 
 ```bash
-sh scripts/ci/install-hooks.sh                          # 装钩子（仅 git config）
-python3 -m unittest discover -s scripts/ci/tests        # 单元自测
-python3 scripts/ci/check_mermaid.py                     # mermaid 检查
-python3 scripts/ci/recalc_amount.py                     # 金额复算 + 文档比对
+sh scripts/ci/install-hooks.sh                          # 装钩子（git config + 两钩 chmod）
+python3 scripts/ci/check_commit_msg.py --range origin/develop..HEAD  # Gate 1 提交规范
+python3 scripts/ci/check_mermaid.py                     # Gate 2 mermaid 检查
+python3 scripts/ci/recalc_amount.py                     # Gate 3 金额复算 + 文档比对
+python3 -m unittest discover -s scripts/ci/tests        # Gate 4 单元自测
+python3 eval/metrics/validate_schema.py                 # Gate 5 评测集结构回归
+npx --yes @redocly/cli lint --config contracts/redocly.yaml contracts/{chat,orders,sessions,feedback,escalate,notifications,shared-schemas}-v1.yaml 2>/dev/null || npx --yes @redocly/cli lint --config contracts/redocly.yaml $(ls contracts/*.yaml | grep -vE 'redocly|errors-dict')   # Gate 6 契约 lint
+docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.21.2 detect --source=/repo --redact --no-banner   # Gate 7 DLP（需 docker）
 ```
 
 ## 与流水线的关系

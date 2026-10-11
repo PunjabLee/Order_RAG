@@ -37,8 +37,11 @@ TYPES = ("feat", "fix", "docs", "refactor", "test", "ci", "chore", "perf", "buil
 # 因此本脚本：scope 语法强制（小写 kebab），枚举不符仅告警不阻断。
 # 依据见文件头说明；扩展 scope 入表建议已记入 IT-1.11 交付报告"发现与建议"（不擅改计划文档）。
 SCOPES = (
+    # 业务模块（§8.3 原枚举）
     "chat", "session", "nlu", "retrieval", "factcheck", "slot", "draft",
     "txn-saga", "security", "observability", "contracts", "docs",
+    # 工程/基建类（计划 V1.1 转正，2026-10-11 G-A 裁决，台账 L-03）
+    "repo", "ci", "eval", "scripts", "hooks", "plan",
 )
 SCOPE_SYNTAX_RE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?:/[a-z0-9-]+)*$")
 

@@ -34,11 +34,19 @@ class TestCommitMsg(unittest.TestCase):
         )
 
     def test_valid_ci_scope_extension_warns_not_blocks(self):
+        # 未转正 scope（如 infra）仍告警放行；工程类 scope 已随计划 V1.1 转正（L-03）
         errors, warnings = check_commit_msg.validate_message(
-            "ci(scripts): commit-msg 钩子与 mermaid 检查\n\nTask: IT-1.11\nRefs: DD-13/附录D\n"
+            "ci(infra): 未转正 scope 验证\n\nTask: IT-1.11\nRefs: DD-13/附录D\n"
         )
         self.assertEqual(errors, [])
         self.assertTrue(any("scope" in w for w in warnings), "未知 scope 应告警")
+
+    def test_engineering_scopes_formal_no_warning(self):
+        for sc in ("repo", "ci", "eval", "scripts", "hooks", "plan"):
+            errors, warnings = check_commit_msg.validate_message(
+                f"chore({sc}): 工程 scope 转正验证\n\nTask: IT-1.11\nRefs: DD-13\n")
+            self.assertEqual(errors, [])
+            self.assertFalse(any("scope" in w for w in warnings), f"`{sc}` 应已枚举内零告警")
 
     def test_task_with_q_annotation(self):
         self.assert_ok("feat(promo): 联调spike桩\n\nTask: IT-1.01 [Q1]\nRefs: DD-15 D-1\n")

@@ -31,8 +31,8 @@
    遗留提交（v2.2-baseline 文档先于任务卡体系产生）；须同时写明理由与显式 `Baseline:` 尾注，缺一拒绝。
    CI 范围模式另认历史豁免登记表 `LEGACY_EXEMPT_COMMITS`（90d894c/942367c/28d0001，收敛规则前提交追认）。
 
-宽松项（告警不阻断）：scope 不在 §8.3 业务枚举内（计划暂未定义 infra 类 scope，见台账 L-03）；
-缺 `Refs:`；标题超长。（多条 `Task:` 已由告警升级为拒绝，不再列入本节）
+宽松项（告警不阻断）：scope 不在 §8.3 枚举内（计划 V1.1 已转正工程类 `repo/ci/eval/scripts/hooks/plan`，
+见台账 L-03；其余未转正 scope 仍告警放行）；缺 `Refs:`；标题超长。（多条 `Task:` 已由告警升级为拒绝，不再列入本节）
 
 ## 快速自检（七连跑；Gate 6 需 node/npm，Gate 7 需本地 docker daemon）
 

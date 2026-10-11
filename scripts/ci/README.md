@@ -9,7 +9,8 @@
 |------|------|---------|
 | `check_commit_msg.py` | 提交信息校验：Conventional Commits + `Task: IT-x.xx` trailer（§8.3 硬约束①） | `python3 scripts/ci/check_commit_msg.py <MSG_FILE>`；CI 范围模式 `--range origin/develop..HEAD` |
 | `.githooks/commit-msg`（仓库根） | commit-msg 钩子包装，调用上述校验器 | 由钩子自动触发，勿手工调用 |
-| `install-hooks.sh` | 安装钩子：`git config core.hooksPath .githooks`（仅仓库级 config） | `sh scripts/ci/install-hooks.sh` |
+| `install-hooks.sh` | 安装钩子：`git config core.hooksPath .githooks`（仅仓库级 config；随装随生效 commit-msg + post-commit 两钩） | `sh scripts/ci/install-hooks.sh` |
+| `.githooks/post-commit`（钩子目录） | 提交成功后自动推送当前分支到 `origin`（首次 `-u` 建跟踪）；护栏：`NO_AUTO_PUSH=1` 开关、rebase/merge/cherry-pick 进行中跳过、游离 HEAD 跳过、无 remote 跳过；失败仅告警不阻断提交，绝不 force | 装钩即生效；验证 `git log origin/<分支>..HEAD` 应为空 |
 | `check_mermaid.py` | 扫描 `*.md`：``` 围栏配对（奇数报错）、mermaid 语法头识别（flowchart/graph/stateDiagram/sequenceDiagram）、块内字面 `\n`（附录 D L-3 要求 `<br/>`）；输出文件+围栏号+行号 | `python3 scripts/ci/check_mermaid.py`（默认全仓，可传文件/目录参数） |
 | `recalc_amount.py` | 按 DD-8.1 独立复算示例金额（纯整数分）并 grep 设计文档 `total_cents`/展示值/减法链比对，不一致即报 | `python3 scripts/ci/recalc_amount.py`；`--no-doc` 只复算 |
 | `pricing_baseline.json` | 复算基线参数（单价分/数量/折扣bp/券分/叠加顺序/舍入步长）。**全部为假设值，挂 Q1/Q7，禁止业务代码硬编码（DD-16 R-07）**；IT-1.07 联调后替换 | 被 `recalc_amount.py` 默认读取 |

@@ -35,8 +35,9 @@
 ## 快速开始
 
 ```bash
-# 1. 安装版本化 Git 钩子（仅 git config core.hooksPath .githooks，仓库级）
+# 1. 安装版本化 Git 钩子（commit-msg 规范卡口 + post-commit 自动推送；仅 git config core.hooksPath .githooks，仓库级）
 sh scripts/ci/install-hooks.sh
+# 提交后自动推送当前分支到 origin；临时关闭：NO_AUTO_PUSH=1 git commit ...
 
 # 2. 本地跑通 CI 同等卡口（详见 scripts/ci/README.md）
 python3 -m unittest discover -s scripts/ci/tests   # 单元自测

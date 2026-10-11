@@ -1,0 +1,86 @@
+# IT-1.11 · CI 基线流水线（七步卡口：骨架四步 + 评审修复补齐 Gate 5~7）
+#
+# 平台说明：本文件为 GitHub Actions 语法。若实际平台为 GitLab CI / Jenkins，
+# 请保持同名七步的等价阶段（返回码非 0 即阻断），并更新本注释（scripts/ci/README.md §与流水线的关系）。
+# 分支保护联动：《研发迭代计划.md》§8.2 —— develop 合入需 "1 Approve + CI 绿"，
+# 本流水线即该"CI 绿"的最小定义。
+name: ci
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop, main]
+
+jobs:
+  engineering-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # commit-msg 范围校验需要完整历史
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ── 步骤 1/7：commit-msg 校验（对范围提交，§8.3 硬约束①） ──────────────
+      - name: Gate 1 · commit message convention (range)
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ -n "$BASE_REF" ]; then
+            RANGE="origin/${BASE_REF}..HEAD"
+          elif [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            RANGE="${SHA}~1..${SHA}"   # 新分支首推：仅校验最新提交
+          else
+            RANGE="${BEFORE}..${SHA}"
+          fi
+          echo "校验提交范围: $RANGE"
+          python3 scripts/ci/check_commit_msg.py --range "$RANGE"
+
+      # ── 步骤 2/7：mermaid 围栏/语法头检查（附录 D，L-3） ────────────────────
+      - name: Gate 2 · mermaid fence & header check
+        run: python3 scripts/ci/check_mermaid.py --root .
+
+      # ── 步骤 3/7：DD-8.1 金额独立复算 + 设计文档基线比对 ─────────────────────
+      - name: Gate 3 · amount recalculation (DD-8.1)
+        run: python3 scripts/ci/recalc_amount.py
+
+      # ── 步骤 4/7：单元自测（单测框架种子，DD-13 单元层） ────────────────────
+      - name: Gate 4 · unit self-tests (stdlib unittest)
+        run: python3 -m unittest discover -s scripts/ci/tests -v
+
+      # ── 步骤 5/7：评测集结构回归（评审 H-1 补位；语义指标回归仍留 IT-2.05） ────
+      - name: Gate 5 · eval golden-set schema check
+        run: python3 eval/metrics/validate_schema.py
+
+      # ── 步骤 6/7：契约 lint（§8.3"MR 必过"补位，评审 H-1/L-1；口径 redocly.yaml） ──
+      - name: Setup node (for redocly-cli)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Gate 6 · OpenAPI lint (redocly)
+        run: |
+          # errors-dict.yaml 非 OpenAPI 规格（号段叙述字典），不进 redocly 清单，单独做 YAML 语法校验
+          npx --yes @redocly/cli lint --config contracts/redocly.yaml \
+            contracts/chat-v1.yaml contracts/orders-v1.yaml contracts/sessions-v1.yaml \
+            contracts/feedback-v1.yaml contracts/escalate-v1.yaml contracts/notifications-v1.yaml \
+            contracts/shared-schemas.yaml
+          npx --yes js-yaml contracts/errors-dict.yaml > /dev/null && echo "errors-dict.yaml 语法 OK"
+
+      # ── 步骤 7/7：DLP 最小实现（凭据/密钥；PII 自研规则扩展留 IT-3.09） ────────
+      - name: Gate 7 · DLP scan (gitleaks)
+        run: |
+          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.21.2 \
+            detect --source=/repo -v --redact --no-banner || {
+            echo "::error::DLP 检出入库凭据/密钥（§8.2 禁止项），阻断合入"; exit 1; }
+
+      # ══ 仍预留的槽位（依赖外部条件，触发任务见注释） ════════════════════════
+      # TODO: IT-1.09 冻结评审 —— mock server 起服 + 前端/交易双消费者契约测试（L-05 解欠前置）。
+      # TODO: IT-2.05 —— 评测语义回归：Recall@5 ≥ 0.9 / 政策命中 ≥ 0.95 / 幻觉率门禁（需检索链路）。
+      # TODO: IT-2.x —— 业务单测/契约测试并入 Gate 4（目录约定 tests/ + discover，夹具来自 IT-1.07）。
+      # TODO: IT-3.09 —— DLP 扩展自研 PII 规则（手机号/身份证/地址精确，DD-5.5 口径）。
+      # TODO: 附录 D 完整渲染 —— mermaid-cli（@mermaid-js/mermaid-cli）headless 渲染全部图至 SVG，待运维排期。

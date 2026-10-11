@@ -1,0 +1,23 @@
+{
+  "_comment": "IT-1.11 金额复算基线配置。全部为假设值，禁止业务代码硬编码（DD-16 R-07）；Q1/Q7 关闭后以促销/商品服务联调返回值替换（IT-1.07，〇.1 示例治理条款）。",
+  "_refs": "设计文档 DD-8.1（推导口径）/ DD-8.2（舍入与尾差）/ DD-7.4（breakdown 结构）/ 研发迭代计划 IT-1.01 门禁（80,497.00 复算比对）",
+  "currency": "CNY",
+  "unit_price_cents": 2999900,
+  "_unit_price_cents_note": "单台 list price ¥29,999.00 = 2,999,900 分。假设值，待 Q7（产品+业务方）确认后替换。",
+  "quantity": 3,
+  "_quantity_note": "示例数量 3 台（企业批量折扣门槛：同一 SKU ≥3 台且企业认证有效，DD-8.1）。",
+  "discount_bp": 1000,
+  "_discount_bp_note": "企业批量折扣 9 折 = 立减 1000bp（万分比，pay_ratio = (10000-bp)/10000 = 0.9）。折扣比例定义权在促销服务（Q1/Q7）。",
+  "discount_qualify_min_quantity": 3,
+  "_discount_qualify_min_quantity_note": "批量折扣门槛 ≥3 台（DD-8.1）。",
+  "coupon_cents": 50000,
+  "_coupon_cents_note": "满减立减 ¥500.00 = 50,000 分（示例券 promo_batch_9，〇.1 示例治理）。",
+  "coupon_threshold_cents": 8000000,
+  "_coupon_threshold_cents_note": "满减门槛：单笔应付 ≥ ¥80,000.00（DD-8.1）。门槛判定作用对象随叠加顺序变化，见 sequence。",
+  "sequence": "discount_then_coupon",
+  "_sequence_note": "叠加顺序假设『先折后减』（DD-8.1）。顺序定义权归促销服务，按配置项 pricing_sequence 断言，禁止硬编码（Q1/Q7，DD-16 R-07）。可选值：discount_then_coupon | coupon_then_discount（后者文档值 80,547.30）。",
+  "discount_round_step_cents": 100,
+  "_discount_round_step_note": "折扣金额按整元（100 分）四舍五入一次到位：89,997.00×10%=8,999.70 → 9,000.00。口径出处：DD-7.4 breakdown bulk_discount_10pct=-900000 与 DD-8.1『尾差修正 80,497.30→80,497.00（H-11/K-6）』。促销服务联调返回 breakdown 后本参数与规则一并替换（Q1/Q7）。",
+  "expected_total_cents": 8049700,
+  "_expected_note": "默认参数复算应得 8,049,700 分（¥80,497.00），等于 breakdown 分项之和 8999700-900000-50000（DD-8.2 尾差计入最后一项 → 分项和恒等于总额）。"
+}

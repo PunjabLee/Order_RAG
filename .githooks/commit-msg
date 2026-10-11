@@ -1,0 +1,10 @@
+#!/bin/sh
+# IT-1.11 · commit-msg 钩子：校验 §8.3 提交规范（Conventional Commits + Task trailer）。
+# 安装：sh scripts/ci/install-hooks.sh   （核心动作 git config core.hooksPath .githooks）
+# 注意：§8.3 硬约束③ 禁 `git commit --no-verify` 跳过本钩子。
+set -u
+
+ROOT="$(git rev-parse --show-toplevel)" || exit 1
+PY="${PYTHON:-python3}"
+
+exec "$PY" "$ROOT/scripts/ci/check_commit_msg.py" "$1"

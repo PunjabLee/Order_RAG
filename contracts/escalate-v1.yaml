@@ -1,0 +1,135 @@
+openapi: 3.0.3
+info:
+  title: "TradeWise API v1 - 转人工（Escalate）"
+  version: "1.0.0"
+  description: |
+    权威来源：《设计文档.md》DD-7.1 总览表（转人工行：POST /api/v1/chat/escalate，Bearer，幂等标注"—"，
+    非流式，错误码前缀"—"，US-009）、DD-7.7（交接体：槽位快照+最近20轮+草稿态+trace_id）、
+    US-009-S1/S2/S3（交接内容清单；非工作时间→留言工单+预计响应时间；结果回流 source=human_agent 走 DD-11.5/MQ，
+    回流 kind=escalate_result 经 feedback 内部链路，不由客户端提交）、DD-6.4（话术降级三级链末端=转人工）。
+
+    红线自查：错误响应含 error_code/trace_id（R-5）；金额不涉及；交接体由服务端组装，
+    客户端不可传入槽位/历史内容（上下文为服务端状态，C-6 同源原则）。
+    兼容性：只增不改不删（DD-7.1）。示例值治理：全部示例为示例值，以实际服务返回为准（〇.1）。
+  x-contract-status: "IT-1.09 冻结预备（frozen-candidate）"
+  x-dd-mapping: "DD-7.1（转人工行）/ DD-7.7 / US-009 / DD-6.4"
+  license:
+    name: "Internal - TradeWise (契约文档随仓库维护，未对外授权)"
+
+servers:
+  - url: https://api.tradewise.example
+    description: "网关基址（示例值，以实际部署为准）"
+
+security:
+  - bearerAuth: []
+
+paths:
+  /api/v1/chat/escalate:
+    post:
+      operationId: escalateToHuman
+      summary: "转人工与客服接管（US-009）"
+      description: |
+        交接体（DD-7.7）：服务端组装 槽位快照 + 最近 20 轮对话 + 草稿态 + trace_id，
+        仅面向客服系统内部暴露（含 PII 脱敏版本，DD-5.5），本接口响应不回传交接体明文。
+        幂等：DD-7.1 标注"—"（无显式幂等键）；同一会话重复触发应合并至既有工单/队列（实现约定，
+        冻结评审前如改判需走契约专道，README G-⑥）。
+        非工作时间（US-009-S2）：mode=ticket（留言工单）并给出 expected_response_at。
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/AuthorizationHeader"
+        - $ref: "shared-schemas.yaml#/components/parameters/XRequestIdHeader"
+        - $ref: "shared-schemas.yaml#/components/parameters/XTenantIdHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EscalateRequest"
+            example:
+              session_id: "opaque_uuid_01HXAMPLE"     # 示例值，以实际服务返回为准
+              reason: "user_explicit"
+      responses:
+        "201":
+          description: "转接已建立（排队或工单创建）。"
+          content:
+            application/json:
+              schema:
+                type: object
+                allOf:
+                  - $ref: "shared-schemas.yaml#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        $ref: "#/components/schemas/EscalateResult"
+        "401":
+          $ref: "shared-schemas.yaml#/components/responses/Err401"
+        "409":
+          description: "状态冲突（如会话状态与转接动作矛盾；具体码待反馈/转人工域错误码收口，README G-⑤⑥）。"
+          content:
+            application/json:
+              schema:
+                $ref: "shared-schemas.yaml#/components/schemas/ErrorEnvelope"
+        "410":
+          description: "RAG-41001 会话过期（引导新会话；410 映射口径见 errors-dict.yaml C-①）。"
+          content:
+            application/json:
+              schema:
+                $ref: "shared-schemas.yaml#/components/schemas/ErrorEnvelope"
+        "422":
+          $ref: "shared-schemas.yaml#/components/responses/Err422"
+        "429":
+          $ref: "shared-schemas.yaml#/components/responses/Err429"
+        "503":
+          $ref: "shared-schemas.yaml#/components/responses/Err503"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: "与 shared-schemas.yaml components.securitySchemes 同构（本文件本地冗余声明，满足 OpenAPI 3.0 security 引用闭环）。"
+
+  schemas:
+    EscalateRequest:
+      description: "转人工请求：仅会话指针 + 触发来源/原因（交接体禁止由客户端组装，服务端权威）。"
+      type: object
+      required: [session_id]
+      additionalProperties: false
+      properties:
+        session_id:
+          type: string
+          description: "当前会话（服务端据此组装槽位快照+最近20轮+草稿态+trace_id，DD-7.7）。示例值，以实际服务返回为准。"
+        reason:
+          type: string
+          nullable: true
+          description: "触发来源（可选）：user_explicit=用户显式要求（DD-6.1 触发条件/意图 ESCALATE_HUMAN）；guard_hit=安全/护栏命中；degrade_tail=话术降级链末端（DD-6.4）。具体枚举以客服系统对接定稿（示例值，以实际服务返回为准）。"
+          enum: [user_explicit, guard_hit, degrade_tail]
+        message_id:
+          type: string
+          nullable: true
+          description: "触发转接的助手消息（可选，便于定位上下文锚点）。"
+    EscalateResult:
+      type: object
+      required: [escalation_id, mode]
+      properties:
+        escalation_id:
+          type: string
+          description: "转接/工单 ID（示例值，以实际服务返回为准）。"
+          example: "esc_01HXAMPLE"
+        mode:
+          type: string
+          description: "live_agent=工作时间接入排队（US-009-S1）；ticket=非工作时间留言工单（US-009-S2）。"
+          enum: [live_agent, ticket]
+        queue_position:
+          type: integer
+          nullable: true
+          description: "排队位次（mode=live_agent 时给出；示例值，以实际客服系统返回为准）。"
+        expected_response_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: "预计响应时间（mode=ticket 必给，US-009-S2；UTC，展示按用户时区 DD-8.4）。"
+        handoff_ref:
+          type: string
+          description: "交接体只读引用（服务端组装的 槽位快照+最近20轮+草稿态+trace_id 存储指针；明文仅客服系统可见，客户端凭 trace_id 溯源）。示例值，以实际服务返回为准。"
+          example: "hof_01HXAMPLE"

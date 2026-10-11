@@ -1,0 +1,465 @@
+openapi: 3.0.3
+info:
+  title: "TradeWise API v1 - 草稿与订单（Orders / Drafts）"
+  version: "1.0.0"
+  description: |
+    权威来源：《设计文档.md》DD-7.4（草稿接口）、DD-7.5（订单创建=整改 C-2 后唯一交易入口）、DD-7.1 总览表
+    （草稿查询/订单查询/订单取消三行）、DD-7.6 + DD-4.3（幂等全语义）、DD-4.1（状态机）、DD-4.2（SAGA）、
+    DD-4.4（TTL 15min 对齐）、DD-8.1（金额示例 8049700 分可独立复算）、DD-9.3（草稿状态枚举）。
+
+    红线自查：
+      - R-1（C-2）：POST /orders 请求体仅 {draft_id, confirm_token}，additionalProperties:false，
+        不含任何价格/优惠/数量/确认类客户端字段（旧 sku/quantity/coupon_id/confirmed/total_amount 全部废弃）；
+      - R-3（H-9）：金额一律 integer 分（total_cents / price_cents / breakdown.cents），禁止 number/float；
+      - R-5：错误响应含 error_code/trace_id（ErrorEnvelope，前缀 ORD-）。
+
+    二次确认模型（DD-7.5/C-2）：confirmed 布尔位删除，二次确认 = draft+token 凭据；
+    confirm_token 为一次性签名 nonce，与 user_id + draft_id + amount_hash 绑定签名（DD-4.3），消费即失效。
+    安全测试矩阵（DD-7.5，验收通过率 100%）：伪造 confirmed / 篡改 coupon_id / 复用 confirm_token /
+    跨用户引用 draft_id / 传入他人 address_id → 全部 4xx + 审计。
+    示例值治理：以下全部示例（SKU_A、addr_001、promo_batch_9、dft_01H…、ctkn_…、ORD20261011001、
+    pv_20261011_0930、¥80,497.00 等）均为示例值，以实际服务返回为准（设计文档 〇.1）。
+  x-contract-status: "IT-1.09 冻结预备（frozen-candidate）"
+  x-dd-mapping: "DD-7.4 / DD-7.5（主）/ DD-7.1 / DD-7.6 / DD-4.1~4.4 / DD-8.1 / DD-9.3"
+  license:
+    name: "Internal - TradeWise (契约文档随仓库维护，未对外授权)"
+
+servers:
+  - url: https://api.tradewise.example
+    description: "网关基址（示例值，以实际部署为准）；URL 主版本 /v1（DD-7.1）"
+
+security:
+  - bearerAuth: []
+
+paths:
+  /api/v1/orders/drafts:
+    post:
+      operationId: createDraft
+      summary: "创建订单草稿（FR-007，整改 C-2）"
+      description: |
+        调用方约束（DD-7.4）：由对话应用服务基于服务端槽位发起；不经 LLM/前端传参。
+        交易要素（sku/quantity/address_id/coupon_id 等）一律由服务端读取会话槽位快照（DD-3.3/3.3.3），
+        请求体不接受任何交易要素字段（additionalProperties:false 结构性拒绝）。
+        幂等（DD-7.1 总览表）：服务端基于槽位（客户端不可传交易要素）——同一槽位指纹的重复创建是否返回
+        同一 draft_id 文档未明示，列为文档缺口（见 contracts/README.md），实现联调时由交易服务定案。
+        降级态禁止创建草稿（DD-6.3①，ORD-40903）；促销/物流试算降级同样禁草稿（RAG-50302/50303）。
+        企业认证校验时机：试算/草稿/下单三点均校验（DD-5.4）；认证失效 → 作废旧草稿（ORD-40905）。
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/AuthorizationHeader"
+        - $ref: "shared-schemas.yaml#/components/parameters/XRequestIdHeader"
+        - $ref: "shared-schemas.yaml#/components/parameters/XTenantIdHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DraftCreateRequest"
+            example:
+              session_id: "opaque_uuid_01HXAMPLE"   # 示例值，以实际服务返回为准
+      responses:
+        "201":
+          description: "草稿签发成功（DD-7.4 Response 201，套 DD-7.2 成功包）。"
+          content:
+            application/json:
+              schema:
+                type: object
+                allOf:
+                  - $ref: "shared-schemas.yaml#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        $ref: "#/components/schemas/Draft"
+              example:
+                code: 0
+                trace_id: "trc_01HZXAMPLE0010"      # 示例值，以实际服务返回为准
+                data:
+                  draft_id: "dft_01HXAMPLE"          # 示例值，以实际服务返回为准
+                  status: "DRAFT"
+                  snapshot:
+                    sku: "SKU_A"                     # 示例值，以实际服务返回为准
+                    quantity: 3
+                    address_id: "addr_001"           # 示例值，以实际服务返回为准（DD-3.3.1 命名 1:1）
+                    coupon_id: "promo_batch_9"       # 示例值，以实际服务返回为准（DD-3.3.1 命名 1:1）
+                  pricing:
+                    currency: "CNY"
+                    total_cents: 8049700             # 示例值（DD-8.1 可复算），以实际服务返回为准
+                    amount_display: "¥80,497.00"     # 示例值，以实际服务返回为准
+                    breakdown:
+                      - { item: "list_price", cents: 8999700 }
+                      - { item: "bulk_discount_10pct", cents: -900000 }
+                      - { item: "threshold_minus_500", cents: -50000 }
+                    pricing_version: "pv_20261011_0930"   # 示例值，以实际服务返回为准
+                    as_of: "2026-10-11T10:05:00Z"
+                  delivery:
+                    earliest: "2026-10-14"
+                    latest: "2026-10-16"
+                    tz: "Asia/Shanghai"
+                  amount_hash: "sha256:示例"          # 示例值，以实际服务返回为准
+                  confirm_token: "ctkn_示例一次性签名nonce"   # 示例值，以实际服务返回为准
+                  expires_at: "2026-10-11T10:20:00Z"  # = created_at + 15min（DD-7.4/DD-4.4）
+        "401":
+          $ref: "shared-schemas.yaml#/components/responses/Err401"
+        "403":
+          $ref: "shared-schemas.yaml#/components/responses/Err403"
+        "409":
+          description: "槽位版本冲突（RAG-40901）/ 认证失效作废（ORD-40905）/ 降级态禁草稿（ORD-40903，若按 409 收口，见 errors-dict 冲突 C-②）。"
+          content:
+            application/json:
+              schema:
+                $ref: "shared-schemas.yaml#/components/schemas/ErrorEnvelope"
+        "422":
+          $ref: "shared-schemas.yaml#/components/responses/Err422"
+        "503":
+          $ref: "shared-schemas.yaml#/components/responses/Err503"
+
+  /api/v1/orders/drafts/{draft_id}:
+    get:
+      operationId: getDraft
+      summary: "草稿查询（渲染确认卡片用，DD-7.1）"
+      description: |
+        鉴权：Bearer + 归属校验（draft 属当前 user，跨用户引用 → 4xx + 审计，DD-7.5 安全矩阵）。
+        注意：confirm_token 仅在创建响应中下发（一次性凭据）；查询渲染视图默认省略 confirm_token ——
+        文档缺口：DD-7.1 该行未定义返回体是否含 token，见 README 冲突/缺项清单。
+      parameters:
+        - name: draft_id
+          in: path
+          required: true
+          schema: { type: string }
+          description: "草稿 ID（示例值，以实际服务返回为准）。"
+        - $ref: "shared-schemas.yaml#/components/parameters/AuthorizationHeader"
+        - $ref: "shared-schemas.yaml#/components/parameters/XRequestIdHeader"
+        - $ref: "shared-schemas.yaml#/components/parameters/XTenantIdHeader"
+      responses:
+        "200":
+          description: "草稿渲染视图（DraftView，不含 confirm_token）。"
+          content:
+            application/json:
+              schema:
+                type: object
+                allOf:
+                  - $ref: "shared-schemas.yaml#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        $ref: "#/components/schemas/DraftView"
+        "401":
+          $ref: "shared-schemas.yaml#/components/responses/Err401"
+        "403":
+          $ref: "shared-schemas.yaml#/components/responses/Err403"
+        "404":
+          description: "草稿不存在（含跨用户引用被归一为 404 的实现选项；最终 403/404 口径待安全评审定案并审计）。"
+          content:
+            application/json:
+              schema:
+                $ref: "shared-schemas.yaml#/components/schemas/ErrorEnvelope"
+        "409":
+          description: "草稿过期 ORD-40901 / 已消费 CONSUMED / 已作废 INVALIDATED（DD-9.3）。"
+          content:
+            application/json:
+              schema:
+                $ref: "shared-schemas.yaml#/components/schemas/ErrorEnvelope"
+
+  /api/v1/orders:
+    post:
+      operationId: createOrder
+      summary: "订单创建（整改 C-2 后的唯一交易入口，DD-7.5）"
+      description: |
+        鉴权：Bearer + confirm_token（DD-7.1）。
+        请求体红线（C-2）：仅 {draft_id, confirm_token}；服务端行为链（DD-7.5）：
+        token 签名/归属/一次性消费校验 → 读草稿快照 → 重算金额与 amount_hash 比对（不一致 ORD-40902）
+        → SAGA（DD-4.2：预占→锁券→写单→支付单→发事件）。
+        旧版入参 sku/quantity/coupon_id/confirmed/total_amount 全部废弃，出现即 422 拒绝（网关层即拒绝，迭代计划 G-C）。
+        降级态拒绝创建（ORD-40903，DD-6.3）。
+        Idempotency-Key（user 级语义，DD-4.3 全语义）：
+          - 作用域 = 同一 user + key 唯一（跨用户同名 key 互不影响）；TTL 24h（DD-9.4）；
+          - 重放（同 key 同请求体）→ 返回首次结果（含原 order_id），HTTP 201（响应体与首次一致）；
+          - 同 key 不同请求体 → 409 ORD-40904；
+          - 结果未知（写超时 ORD-50401）→ 客户端用同 key 同体重发安全；服务端侧重查 order_txn_id，禁止盲重试。
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/AuthorizationHeader"
+        - $ref: "shared-schemas.yaml#/components/parameters/XRequestIdHeader"
+        - $ref: "shared-schemas.yaml#/components/parameters/XTenantIdHeader"
+        - $ref: "shared-schemas.yaml#/components/parameters/IdempotencyKeyHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PlaceOrderRequest"
+            example:
+              draft_id: "dft_01HXAMPLE"               # 示例值，以实际服务返回为准
+              confirm_token: "ctkn_示例"               # 示例值，以实际服务返回为准
+      responses:
+        "201":
+          description: "订单创建成功（DD-7.5 Response 201，套 DD-7.2 成功包）；同键重放返回本首次结果。"
+          content:
+            application/json:
+              schema:
+                type: object
+                allOf:
+                  - $ref: "shared-schemas.yaml#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        $ref: "#/components/schemas/Order"
+              example:
+                code: 0
+                trace_id: "trc_01HZXAMPLE0011"        # 示例值，以实际服务返回为准
+                data:
+                  order_id: "ORD20261011001"          # 示例值，以实际服务返回为准
+                  status: "PENDING_PAYMENT"
+                  total_cents: 8049700                # 示例值（DD-8.1），以实际服务返回为准
+                  currency: "CNY"
+                  payment_url: "https://pay.internal.example/checkout/dft_demo"   # 示例值，以实际服务返回为准
+                  expires_at: "2026-10-11T10:20:00Z"  # = 草稿 expires_at 同源对齐（DD-4.4）
+        "401":
+          $ref: "shared-schemas.yaml#/components/responses/Err401"
+        "403":
+          description: "越权（token 归属他人 draft / 他人地址快照，AUTH-40302 等）+ 审计（DD-7.5 安全矩阵）。"
+          content:
+            application/json:
+              schema:
+                $ref: "shared-schemas.yaml#/components/schemas/ErrorEnvelope"
+        "409":
+          description: "ORD-40901 草稿过期 / ORD-40902 金额变化需重确认 / ORD-40904 幂等冲突 / ORD-40905 认证失效 / ORD-40910 预占失败 / ORD-40911 锁券失败（各自处置见 errors-dict.yaml）。"
+          content:
+            application/json:
+              schema:
+                $ref: "shared-schemas.yaml#/components/schemas/ErrorEnvelope"
+        "422":
+          description: "请求体含废弃字段（sku/quantity/coupon_id/confirmed/total_amount 等）→ 结构性拒绝（红线 R-1）。"
+          content:
+            application/json:
+              schema:
+                $ref: "shared-schemas.yaml#/components/schemas/ErrorEnvelope"
+        "504":
+          description: "订单写超时结果未知（ORD-50401）：响应“处理中，请稍候”+ 客户端禁用重复提交；服务端重查→对账（DD-6.1#6）。"
+          content:
+            application/json:
+              schema:
+                $ref: "shared-schemas.yaml#/components/schemas/ErrorEnvelope"
+        "503":
+          $ref: "shared-schemas.yaml#/components/responses/Err503"
+
+  /api/v1/orders/{order_id}:
+    get:
+      operationId: getOrder
+      summary: "订单查询（状态/支付链接，DD-7.1）"
+      description: "鉴权：Bearer + 归属。返回 DD-7.5 Order 对象；支付链接在 PENDING_PAYMENT 期有效。"
+      parameters:
+        - name: order_id
+          in: path
+          required: true
+          schema: { type: string }
+          description: "订单 ID（示例值，以实际服务返回为准）。"
+        - $ref: "shared-schemas.yaml#/components/parameters/AuthorizationHeader"
+        - $ref: "shared-schemas.yaml#/components/parameters/XRequestIdHeader"
+        - $ref: "shared-schemas.yaml#/components/parameters/XTenantIdHeader"
+      responses:
+        "200":
+          description: "订单当前状态视图。"
+          content:
+            application/json:
+              schema:
+                type: object
+                allOf:
+                  - $ref: "shared-schemas.yaml#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        $ref: "#/components/schemas/Order"
+        "401":
+          $ref: "shared-schemas.yaml#/components/responses/Err401"
+        "403":
+          $ref: "shared-schemas.yaml#/components/responses/Err403"
+        "404":
+          description: "订单不存在（含跨归属引用归一 404 的实现选项，口径同草稿查询，待安全评审）。"
+          content:
+            application/json:
+              schema:
+                $ref: "shared-schemas.yaml#/components/schemas/ErrorEnvelope"
+
+  /api/v1/orders/{order_id}/cancel:
+    post:
+      operationId: cancelOrder
+      summary: "订单取消（幂等，触发补偿链，DD-7.1/DD-7.7）"
+      description: |
+        鉴权：Bearer + 归属（个人认证=本人单、企业认证=本人单，DD-5.4）。
+        幂等：状态机保证（DD-7.1）——重复取消返回同一终态结果，不重复触发补偿；
+        触发释券/释库补偿链（DD-7.7、DD-4.2 逆序补偿）；
+        PENDING_PAYMENT 取消 → CANCELLED；补偿进行中出现 → COMPENSATING（对账兜底）。
+      parameters:
+        - name: order_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: "shared-schemas.yaml#/components/parameters/AuthorizationHeader"
+        - $ref: "shared-schemas.yaml#/components/parameters/XRequestIdHeader"
+        - $ref: "shared-schemas.yaml#/components/parameters/XTenantIdHeader"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              maxProperties: 0
+              description: "空对象 {}；取消不接受任何参数（DD-7.1/7.7 未定义请求字段，出现字段 → 422）。"
+      responses:
+        "200":
+          description: "取消受理/已终态（幂等返回）。"
+          content:
+            application/json:
+              schema:
+                type: object
+                allOf:
+                  - $ref: "shared-schemas.yaml#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [order_id, status]
+                        properties:
+                          order_id: { type: string }
+                          status:
+                            type: string
+                            enum: [CANCELLED, COMPENSATING]
+                            description: "取消后状态（DD-4.1；补偿链异步完成，终态经订单查询轮询/回调获取）。"
+        "401":
+          $ref: "shared-schemas.yaml#/components/responses/Err401"
+        "403":
+          $ref: "shared-schemas.yaml#/components/responses/Err403"
+        "404":
+          description: "订单不存在。"
+          content:
+            application/json:
+              schema:
+                $ref: "shared-schemas.yaml#/components/schemas/ErrorEnvelope"
+        "409":
+          description: "非法状态取消（如 PAID 后取消 → 走退款流程，状态机迁移表拒绝，DD-4.1/DD-6.1#8 同源机制）。"
+          content:
+            application/json:
+              schema:
+                $ref: "shared-schemas.yaml#/components/schemas/ErrorEnvelope"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: "与 shared-schemas.yaml components.securitySchemes 同构（本文件本地冗余声明，满足 OpenAPI 3.0 security 引用闭环）。"
+
+  schemas:
+    DraftCreateRequest:
+      description: |
+        草稿创建请求（DD-7.4）。文档缺口说明：DD-7.4 未显式给出请求体，仅注"由对话应用服务基于服务端槽位发起；
+        不经 LLM/前端传参"——本契约收口为仅携带 session_id（服务端读取会话槽位的指针），
+        additionalProperties:false 结构性禁止任何交易要素字段（C-2 红线在草稿侧的同款免疫）。
+      type: object
+      required: [session_id]
+      additionalProperties: false
+      x-forbidden-fields-note: "sku/quantity/price/coupon_id/address_id/total_amount 等一律不可传（服务端槽位权威，DD-7.4）"
+      properties:
+        session_id:
+          type: string
+          description: "会话 ID（服务端据此读取 DD-3.3.1 槽位快照并冻结，DD-3.3.3）。示例值，以实际服务返回为准。"
+          example: "opaque_uuid_01HXAMPLE"
+
+    DraftView:
+      description: |
+        草稿渲染视图（DD-7.4 响应字段全集，不含 confirm_token）。
+        expires_at = created_at + 15min，与预占/锁券 TTL 对齐（DD-4.4；created_at 未在 DD-7.4 示例中，不擅自添加）。
+      type: object
+      required: [draft_id, status, snapshot, pricing, delivery, amount_hash, expires_at]
+      properties:
+        draft_id:
+          type: string
+          example: "dft_01HXAMPLE"           # 示例值，以实际服务返回为准
+        status:
+          $ref: "shared-schemas.yaml#/components/schemas/DraftStatus"
+        snapshot:
+          description: "冻结的槽位快照（DD-3.3.3；DD-7.4 示例含 sku/quantity/address_id/coupon_id 四字段，product/delivery_date 允许缺省）。"
+          allOf:
+            - $ref: "shared-schemas.yaml#/components/schemas/Slot"
+          x-dd-example-required: [sku, quantity, address_id, coupon_id]
+        pricing:
+          $ref: "shared-schemas.yaml#/components/schemas/DraftPricing"
+        delivery:
+          $ref: "shared-schemas.yaml#/components/schemas/DeliveryWindow"
+        amount_hash:
+          type: string
+          description: "草稿金额快照 SHA-256（附录 C 术语）；确认时与重算结果比对（ORD-40902）。"
+          example: "sha256:示例"              # 示例值，以实际服务返回为准
+        expires_at:
+          $ref: "shared-schemas.yaml#/components/schemas/DateTimeUTC"
+
+    Draft:
+      description: "草稿创建响应体 = DraftView + confirm_token（一次性凭据仅创建时下发）。"
+      allOf:
+        - $ref: "#/components/schemas/DraftView"
+        - type: object
+          required: [confirm_token]
+          properties:
+            confirm_token:
+              type: string
+              description: "一次性签名 nonce，与 user_id+draft_id+amount_hash 绑定（DD-4.3）；消费即失效；仅下发给创建调用方（服务端代发链路），禁止落日志明文（DD-5.5）。"
+              example: "ctkn_示例一次性签名nonce"   # 示例值，以实际服务返回为准
+
+    Order:
+      description: |
+        订单对象（DD-7.5 Response 201 逐字段对齐 + amount_display 为 DD-7.2 展示串规范的补充可选字段）。
+        金额红线：total_cents 为 integer 分，禁止浮点。
+      type: object
+      required: [order_id, status, total_cents, currency, expires_at]
+      properties:
+        order_id:
+          type: string
+          example: "ORD20261011001"          # 示例值，以实际服务返回为准
+        status:
+          $ref: "shared-schemas.yaml#/components/schemas/OrderStatus"
+        total_cents:
+          type: integer                        # 红线：integer，禁止 number/float
+          minimum: 0
+          example: 8049700                    # 示例值（DD-8.1 可复算），以实际服务返回为准
+        currency:
+          type: string
+          enum: ["CNY"]
+        amount_display:
+          type: string
+          nullable: true
+          description: "展示串（DD-7.2 通用规范要求；DD-7.5 示例未列出，作可选补充，联调时以促销/订单服务实际返回替换——文档缺口 G-③）。"
+          example: "¥80,497.00"               # 示例值，以实际服务返回为准
+        payment_url:
+          type: string
+          format: uri
+          nullable: true
+          description: "支付链接（PENDING_PAYMENT 期有效；DD-4.2 步5）。示例值，以实际服务返回为准。"
+          example: "https://pay.internal.example/checkout/dft_demo"
+        expires_at:
+          $ref: "shared-schemas.yaml#/components/schemas/DateTimeUTC"
+
+    PlaceOrderRequest:
+      description: |
+        下单请求体（DD-7.5，整改 C-2 后唯一交易入口）。字段集收口为仅 {draft_id, confirm_token}：
+        additionalProperties:false 结构性拒绝一切价格/优惠/数量/确认类客户端字段——
+        旧版 sku / quantity / coupon_id / confirmed / total_amount 入参全部废弃（C-2 明列）；
+        confirmed:true 布尔位删除，二次确认 = draft+token 凭据（DD-7.5）。
+        数量/地址/券的权威来源 = 服务端草稿快照（DD-7.4 snapshot），与本请求体无关。
+      type: object
+      required: [draft_id, confirm_token]
+      additionalProperties: false        # 红线 R-1（C-2）：不得含任何价格/优惠/数量/确认类字段
+      x-removed-fields:
+        sku: "废弃（C-2）：取草稿快照"
+        quantity: "废弃（C-2）：取草稿快照"
+        coupon_id: "废弃（C-2）：取草稿快照"
+        confirmed: "废弃（C-2）：布尔确认位删除，二次确认=draft+token 凭据"
+        total_amount: "废弃（C-2）：金额由服务端重算并与 amount_hash 比对（ORD-40902）"
+      properties:
+        draft_id:
+          type: string
+          description: "草稿 ID（归属校验：跨用户引用 → 4xx + 审计，DD-7.5 安全矩阵）。示例值，以实际服务返回为准。"
+          example: "dft_01HXAMPLE"
+        confirm_token:
+          type: string
+          description: "一次性签名 nonce（DD-4.3）：签名/归属/一次性消费校验，消费即失效；重放 → 4xx + token 重放审计（DD-5.5）。示例值，以实际服务返回为准。"
+          example: "ctkn_示例"

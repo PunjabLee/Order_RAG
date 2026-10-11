@@ -1,0 +1,44 @@
+#!/bin/sh
+# IT-1.11 配套 · post-commit 钩子：提交成功后自动推送当前分支到 origin。
+# 安装：sh scripts/ci/install-hooks.sh（core.hooksPath=.githooks，本钩子随之生效）
+# 开关：NO_AUTO_PUSH=1 git commit ...   （rebase/amend 批量、离线场景临时关闭）
+# 原则：推送失败绝不阻断提交（统一 exit 0）；绝不做 force push。
+set -u
+
+# 1) 显式开关
+[ "${NO_AUTO_PUSH:-0}" = "1" ] && exit 0
+
+ROOT="$(git rev-parse --show-toplevel)" || exit 0
+GIT_DIR_PATH="$(git rev-parse --git-dir)" || exit 0
+case "$GIT_DIR_PATH" in
+  /*) GIT_DIR_ABS="$GIT_DIR_PATH" ;;
+  *)  GIT_DIR_ABS="$ROOT/$GIT_DIR_PATH" ;;
+esac
+
+# 2) 护栏：交互式历史操作进行中，跳过
+if [ -d "$GIT_DIR_ABS/rebase-merge" ] || [ -d "$GIT_DIR_ABS/rebase-apply" ] \
+   || [ -f "$GIT_DIR_ABS/MERGE_HEAD" ] || [ -f "$GIT_DIR_ABS/CHERRY_PICK_HEAD" ]; then
+  echo "[post-commit] 检测到 rebase/merge/cherry-pick 进行中，跳过自动推送（历史操作请完成后手动 git push）"
+  exit 0
+fi
+
+# 3) 护栏：游离 HEAD（detached）无分支可推
+BRANCH="$(git symbolic-ref --quiet --short HEAD)" || {
+  echo "[post-commit] 当前为游离 HEAD，跳过自动推送"
+  exit 0
+}
+
+# 4) 护栏：无 remote 的纯本地仓库
+if [ -z "$(git remote)" ]; then
+  echo "[post-commit] 本仓库未配置 remote，跳过自动推送"
+  exit 0
+fi
+
+# 5) 推送当前分支到 origin（首次自动建立上游跟踪）
+if git push -u origin "$BRANCH" 2>&1; then
+  echo "[post-commit] 已自动推送 $BRANCH -> origin"
+else
+  echo "[post-commit] ⚠ 自动推送失败（可能 non-fast-forward / 网络 / 权限）。提交已保留，请手工处理："
+  echo "              git pull --rebase origin $BRANCH && git push origin $BRANCH"
+fi
+exit 0

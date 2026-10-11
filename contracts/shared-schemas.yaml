@@ -1,0 +1,451 @@
+openapi: 3.0.3
+info:
+  title: "TradeWise API v1 - 共享 Schema（Shared Schemas）"
+  version: "1.0.0"
+  description: |
+    来源权威：《设计文档.md》DD-7.2（统一响应包/金额/时间/必填头）、DD-3.3.1（槽位字段 1:1：address_id/coupon_id）、
+    DD-3.6.3（citation 契约）、DD-3.6.2/3.6.3（fact_check 状态）、DD-4.1/DD-9.3（状态枚举）、DD-8.1/DD-8.2/DD-8.4（金额与时间口径）、
+    DD-7.6（幂等语义引用）。
+
+    红线（每次变更自查）：
+      - R-3（H-9）金额一律最小货币单位整数（分），type=integer，禁止 number/float；
+      - R-4（C-5）每个事实类响应必须含 citations[] 与 fact_check.status；
+      - R-5 所有错误响应必须含 error_code / trace_id（ErrorEnvelope）。
+
+    本文件为 components-only 共享件，被 chat-v1 / orders-v1 / sessions-v1 / feedback-v1 / escalate-v1 / notifications-v1 引用。
+    兼容性策略（DD-7.1）：只增不改不删；字段废弃走 Deprecation 头 + 1 个季度过渡。
+    示例值治理（设计文档 〇.1）：本文件所有 example 均为示例值，以实际服务返回为准。
+  x-contract-status: "IT-1.09 冻结预备（frozen-candidate）"
+  x-authoritative-source: "设计文档.md DD-7 / DD-8 / DD-3.3.1 / DD-3.6 / DD-4 / DD-6.1 / DD-9"
+
+  license:
+    name: "Internal - TradeWise (契约文档随仓库维护，未对外授权)"
+
+# components-only 文件；paths 置空以满足 OpenAPI 3.0 结构要求
+paths: {}
+
+servers:
+  - url: https://api.tradewise.example
+    description: "网关基址（示例值，以实际部署为准）；共享件引用文件，servers 仅为结构合规"
+
+security:
+  - bearerAuth: []
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        全链路必填头 Authorization: Bearer <token>（DD-7.2）。
+        鉴权时序（DD-5.2）：GW 验 token → AUTH 校验（角色/租户）→ session 与 token 主体绑定校验
+        （不一致 401 + SESSION_OWNER_MISMATCH 审计）。
+
+  parameters:
+    AuthorizationHeader:
+      name: Authorization
+      in: header
+      required: true
+      description: "Bearer 用户令牌（DD-7.2 必填头）。"
+      schema:
+        type: string
+    XRequestIdHeader:
+      name: X-Request-Id
+      in: header
+      required: true
+      description: "请求追踪 ID（DD-7.2 必填头）；与响应中的 trace_id 关联可溯源。"
+      schema:
+        type: string
+    XTenantIdHeader:
+      name: X-Tenant-Id
+      in: header
+      required: false
+      description: |
+        租户标识（DD-7.2 必填头之一）：由网关注入，客户端不可传（客户端传入值一律被网关覆盖/拒绝）；
+        服务端到服务端直连时须携带内部签注值。此处 required=false 表示"对客户端调用方非必填（禁传）"，
+        网关到业务的内部链路上为必填。
+      schema:
+        type: string
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        幂等键（DD-4.3 全语义，DD-7.6）：作用域 = user 级（同一 user+key 唯一），TTL 24h；
+        重放（同 key 同请求体）→ 返回首次结果（含原 order_id）；
+        同 key 不同请求体 → 409 `ORD-40904`；存储 idempotency 表（DD-9.4）。
+      schema:
+        type: string
+
+  responses:
+    Err401:
+      description: "未认证/会话失效（token 无效、缺失或 session 过期 RAG-41001）。文档冲突提示：DD-5.2 会话归属不一致（SESSION_OWNER_MISMATCH）尚无专属错误码，见 errors-dict.yaml x-document-conflicts。"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    Err403:
+      description: "越权拒绝（如 AUTH-40302 地址归属越权；DD-5.4 授权矩阵拒绝），落审计（DD-5.5）。"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    Err409:
+      description: "状态冲突（ORD-40901/40902/40904/40905/40910/40911、RAG-40901 等，按错误码字典）。"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    Err422:
+      description: "入参校验失败（结构非法、超上限，如 RAG-42201 数量超限购）。"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    Err429:
+      description: "网关限流命中 GW-429（DD-6.1 附注：HTTP 429 + Retry-After + 排队提示）。"
+      headers:
+        Retry-After:
+          description: "建议重试等待秒数（指数退避基线 200ms 起，DD-6.2）。"
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    Err503:
+      description: "依赖降级/禁交易（RAG-50301/50302/50303、LLM-503、ORD-40903 降级态禁交易；DD-6.3）。"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+
+  schemas:
+
+    # ---------- 统一响应包（DD-7.2） ----------
+    SuccessEnvelope:
+      description: "成功响应包：{code:0, data, trace_id}（DD-7.2）。SSE 主链路（/chat 200）不套用本包，trace_id 由 meta 事件帧携带。"
+      type: object
+      required: [code, trace_id]
+      properties:
+        code:
+          type: integer
+          enum: [0]
+          description: "业务成功恒为 0。"
+        data:
+          type: object
+          description: "业务数据载荷（各接口定义）。"
+        trace_id:
+          type: string
+          description: "全链路追踪 ID（示例值，以实际服务返回为准）。"
+          example: "trc_01HZXAMPLE0001"
+
+    ErrorEnvelope:
+      description: "错误响应包：{code, error:{error_code, message, detail, trace_id}} + 对应 HTTP 状态码（DD-7.2）。红线 R-5：任何错误响应必含 error_code 与 trace_id。"
+      type: object
+      required: [code, error]
+      properties:
+        code:
+          type: integer
+          description: "非 0 业务错误码（与 error.error_code 字典联动，映射见 errors-dict.yaml）。示例值，以实际服务返回为准。"
+          example: 40902
+        error:
+          $ref: "#/components/schemas/ErrorObject"
+
+    ErrorObject:
+      type: object
+      required: [error_code, message, trace_id]
+      properties:
+        error_code:
+          type: string
+          description: "错误码，必须命中 errors-dict.yaml 字典（前缀 RAG-/ORD-/AUTH-/LLM-/SAFE-/GW-，DD-7.2；另有 NLU-/LOGI- 前缀待收口，见文档冲突清单）。"
+          example: "ORD-40902"
+        message:
+          type: string
+          description: "面向用户的安全文案（不含内部实现细节；降级/拦截场景为合规话术）。"
+        detail:
+          type: object
+          nullable: true
+          description: "结构化补充信息（如 ORD-40902 附新旧 amount_hash 与重算 diff 的脱敏摘要；可为 null）。"
+        trace_id:
+          type: string
+          description: "全链路追踪 ID（必含，红线 R-5）。示例值，以实际服务返回为准。"
+          example: "trc_01HZXAMPLE0002"
+
+    # ---------- 金额（DD-7.2 / DD-8.1 / DD-8.2；红线：禁浮点） ----------
+    Money:
+      description: |
+        金额三元组（DD-7.2）：最小货币单位整数（分）+ currency + amount_display 展示串；禁用浮点。
+        金额唯一权威方 = 促销服务（DD-8.2），RAG/LLM/前端不得自行运算金额。
+        舍入：分位四舍五入一次到位，尾差计入最后一项明细（DD-8.2）。
+        注意：线上字段名按 DD-7.4/7.5 采用 total_cents / price_cents / cents 等 *_cents 命名，本 schema 为口径说明的复用概念件。
+      type: object
+      required: [currency, cents, amount_display]
+      properties:
+        currency:
+          type: string
+          enum: ["CNY"]
+          description: "V1 仅 CNY（DD-7.2）。"
+        cents:
+          type: integer          # 红线：integer，禁止 number/float
+          description: "最小货币单位（分）整数。顶层金额 ≥0；breakdown 明细项允许负数（优惠减项）。"
+          example: 8049700        # 示例值（¥80,497.00，DD-8.1 可独立复算），以实际服务返回为准
+        amount_display:
+          type: string
+          description: "展示串（千分位格式化，仅展示用，不参与计算）。"
+          example: "¥80,497.00"   # 示例值，以实际服务返回为准
+
+    PriceBreakdownItem:
+      description: "优惠/价格明细行（DD-7.4 pricing.breakdown；含税/运费/发票类型显式列项，DD-8.2）。item 枚举以促销服务 breakdown 为准（示例 list_price / bulk_discount_10pct / threshold_minus_500，Q7 待业务确认）。"
+      type: object
+      required: [item, cents]
+      properties:
+        item:
+          type: string
+          example: "bulk_discount_10pct"  # 示例值，以实际服务返回为准
+        cents:
+          type: integer                    # 红线：integer，禁止 number/float
+          description: "该行金额（分），可为负（减项）。尾差计入最后一项明细（DD-8.2）。"
+          example: -900000                 # 示例值，以实际服务返回为准
+
+    DraftPricing:
+      description: |
+        草稿定价快照（DD-7.4）。示例金额可按 DD-8.1 独立复算：
+        3 × 29,999.00 = 89,997.00 → ×0.9 = 80,997.00 → −500.00 = 80,497.00（先折后减，顺序定义权在促销服务，Q7）。
+      type: object
+      required: [currency, total_cents, amount_display, breakdown, pricing_version, as_of]
+      properties:
+        currency:
+          type: string
+          enum: ["CNY"]
+        total_cents:
+          type: integer                    # 红线：integer，禁止 number/float
+          minimum: 0
+          example: 8049700                 # 示例值（DD-8.1），以实际服务返回为准
+        amount_display:
+          type: string
+          example: "¥80,497.00"            # 示例值，以实际服务返回为准
+        breakdown:
+          type: array
+          items:
+            $ref: "#/components/schemas/PriceBreakdownItem"
+        pricing_version:
+          type: string
+          description: "价格快照版本（草稿创建时冻结全量快照，DD-3.3.3）。示例值，以实际服务返回为准。"
+          example: "pv_20261011_0930"
+        as_of:
+          $ref: "#/components/schemas/DateTimeUTC"
+
+    # ---------- 时间（DD-7.2 / DD-8.4） ----------
+    DateTimeUTC:
+      type: string
+      format: date-time
+      description: "内部统一 UTC ISO8601（如 2026-10-11T10:05:00Z）；展示层按用户时区渲染（DD-7.2/DD-8.4）。"
+      example: "2026-10-11T10:05:00Z"     # 示例值，以实际服务返回为准
+
+    DateWithTz:
+      description: "日期 + 时区说明对（DD-8.4：日期字段携带 tz；'今天'=用户时区自然日；截单 15:00 用户时区配置化）。"
+      type: object
+      required: [date, tz]
+      properties:
+        date:
+          type: string
+          format: date
+          example: "2026-10-14"            # 示例值，以实际服务返回为准
+        tz:
+          type: string
+          description: "IANA 时区标识。"
+          example: "Asia/Shanghai"
+
+    DeliveryWindow:
+      description: "交期区间（DD-7.4 delivery；DD-8.4：earliest/latest 区间 + 置信说明，分仓发货取最晚仓；工作日口径由物流服务 working_days_only 声明）。"
+      type: object
+      required: [earliest, latest, tz]
+      properties:
+        earliest:
+          type: string
+          format: date
+          example: "2026-10-14"            # 示例值，以实际服务返回为准
+        latest:
+          type: string
+          format: date
+          example: "2026-10-16"            # 示例值，以实际服务返回为准
+        tz:
+          type: string
+          example: "Asia/Shanghai"
+        confidence_note:
+          type: string
+          nullable: true
+          description: "置信说明（DD-8.4；可选，示例值以物流实际返回为准）。"
+
+    # ---------- 槽位（DD-3.3.1，命名与接口 1:1：address_id / coupon_id） ----------
+    SlotName:
+      type: string
+      description: "槽位名枚举（DD-3.3.1 六字段，与接口 1:1）。"
+      enum: [product, sku, quantity, address_id, coupon_id, delivery_date]
+
+    Slot:
+      description: |
+        槽位值对象（DD-3.3.1 字段规范表 1:1）。来源优先级与校验规则由服务端执行：
+        product 归一化命中商品服务名称/别名索引；sku 存在性+可售（on_sale=true）；
+        quantity 1 ≤ q ≤ min(限购上限, 单笔预算上限)；address_id 归属校验（属于当前 user）+可达性预检；
+        coupon_id 冲突时以用户显式输入为准并展示对比；delivery_date 按 DD-8.4 口径解析。
+        消解/槽位结果仅作读侧参数，绝不直接作为交易参数（DD-3.2.4/ADR-001）。
+      type: object
+      properties:
+        product:
+          type: string
+          nullable: true
+          example: "Mac Studio"            # 示例值，以实际服务返回为准
+        sku:
+          type: string
+          nullable: true
+          example: "SKU_A"                 # 示例值，以实际服务返回为准
+        quantity:
+          type: integer
+          nullable: true
+          minimum: 1
+          example: 3                        # 示例值（Q7 夹具），以实际服务返回为准
+        address_id:
+          type: string
+          nullable: true
+          example: "addr_001"               # 示例值，以实际服务返回为准（命名与 DD-3.3.1 1:1）
+        coupon_id:
+          type: string
+          nullable: true
+          example: "promo_batch_9"          # 示例值，以实际服务返回为准（命名与 DD-3.3.1 1:1）
+        delivery_date:
+          type: string
+          format: date
+          nullable: true
+          example: "2026-10-13"             # 示例值，以实际服务返回为准
+
+    SlotFactMeta:
+      description: "API 填充槽位的事实元数据（DD-3.3.3：as_of + fact_version；草稿创建时冻结全量快照）。"
+      type: object
+      properties:
+        as_of:
+          type: string
+          format: date-time
+          nullable: true
+          description: "UTC ISO8601（口径同 DateTimeUTC）；OpenAPI 3.0 下 nullable 必须与 type 平级，故不用 $ref+nullable 组合。"
+        fact_version:
+          type: string
+          nullable: true
+          example: "fv_20261011_0930"       # 示例值，以实际服务返回为准
+
+    SlotMeta:
+      description: "槽位 → 事实元数据映射（DD-7.3 slots 帧示例 slot_meta）。key 限定为 SlotName 六字段。"
+      type: object
+      additionalProperties:
+        $ref: "#/components/schemas/SlotFactMeta"
+      x-note: "OpenAPI 3.0 无法将 additionalProperties 的 key 约束为枚举，key ∈ SlotName 由服务端校验与契约测试保证。"
+
+    SlotsFrame:
+      description: "SSE slots 帧载荷（DD-7.3 示例）：槽位当前值 + missing_slots + slot_meta。"
+      allOf:
+        - $ref: "#/components/schemas/Slot"
+        - type: object
+          required: [missing_slots]
+          properties:
+            missing_slots:
+              type: array
+              description: "缺失的必填槽位名列表（按 DD-3.3.2 意图×槽位必填矩阵计算）。"
+              items:
+                $ref: "#/components/schemas/SlotName"
+            slot_meta:
+              $ref: "#/components/schemas/SlotMeta"
+
+    # ---------- 引用与事实校验（DD-3.6.3 / DD-7.3；红线 R-4） ----------
+    Citation:
+      description: |
+        引用来源（DD-3.6.3）：{source_type: api|kb|policy, api_source, doc_id, chunk_id, policy_version, as_of}。
+        约束：source_type=api 时 api_source 必填；source_type=kb|policy 时 doc_id/chunk_id/policy_version 必填。
+        每条含事实的回复必须携带 citations[]；无任何 citations 且意图为事实类 → fact_check.status=no_evidence → "未找到依据"话术（US-007-S3）。
+      type: object
+      required: [source_type, as_of]
+      properties:
+        source_type:
+          type: string
+          enum: [api, kb, policy]
+        api_source:
+          type: string
+          nullable: true
+          description: "source_type=api 时必填：product_service | promo_service | logistics_service | user_service | order_service（DD-3.5.1 只读白名单范围）。"
+          example: "product_service"        # 示例值，以实际服务返回为准
+        doc_id:
+          type: string
+          nullable: true
+          description: "source_type=kb|policy 时必填（DD-3.4.2 chunk 元数据）。"
+        chunk_id:
+          type: string
+          nullable: true
+          description: "source_type=kb|policy 时必填（DD-3.4.2）。"
+        policy_version:
+          type: string
+          nullable: true
+          description: "政策类必填，版本可追溯（DD-3.4.2）。"
+        as_of:
+          $ref: "#/components/schemas/DateTimeUTC"
+
+    FactCheck:
+      description: |
+        事实校验结果帧（DD-7.3 / DD-3.6.2）。status 语义：
+          pass=校验通过；blocked=不一致→拦截后模板直出（正确数字由代码拼入，记 hallucination.blocked P1 告警）；
+          no_evidence=事实类意图且无 citations（返回"未找到依据"话术，禁止自由发挥）。
+        价格/优惠金额类 0 分容差（强制一致）；交期允许表述不同但端点一致（DD-3.6.2）。
+      type: object
+      required: [status, checked_facts]
+      properties:
+        status:
+          type: string
+          enum: [pass, blocked, no_evidence]
+        checked_facts:
+          type: integer
+          minimum: 0
+          description: "本轮被逐项比对的事实数字个数。"
+          example: 2
+
+    # ---------- 会话/流式公共枚举 ----------
+    ChatResponseType:
+      type: string
+      description: "meta 帧 type 枚举收口（DD-7.3，整改 H-9①，八枚举，禁止扩散）。"
+      enum: [answer, clarification, draft_card, order_result, no_match, out_of_scope, degraded, escalate]
+
+    DraftStatus:
+      type: string
+      description: "草稿状态（DD-9.3；作废事件：过期/槽位修改/认证失效/降级态 ORD-40903/40905，DD-7.4）。"
+      enum: [DRAFT, CONSUMED, INVALIDATED, EXPIRED]
+
+    OrderStatus:
+      type: string
+      description: |
+        订单状态（DD-4.1 状态机；DRAFT/INVALIDATED 为草稿态不出现在订单对象中）。
+        合法迁移由服务端状态机迁移表保证（DD-6.1#8：乱序回调拒绝非法回退）。
+      enum: [RESERVED, PENDING_PAYMENT, PAID, CANCELLED, COMPENSATING, FAILED]
+
+    OptionItem:
+      description: |
+        可点选澄清/替代选项（DD-7.3 options 帧；US-003-S4 库存不足时含替代 SKU 或 action=subscribe_arrival）。
+        value 为服务端对象 ID（sku_id 等），仅作读侧澄清回填，不得直接作为交易参数（DD-3.2.4）。
+      type: object
+      required: [label, value]
+      properties:
+        label:
+          type: string
+          example: "Mac Studio M2 Ultra 64G/1T"   # 示例值，以实际服务返回为准
+        value:
+          type: string
+          example: "sku_id_1"                     # 示例值，以实际服务返回为准
+        price_cents:
+          type: integer                            # 红线：integer，禁止 number/float
+          nullable: true
+          minimum: 0
+          example: 1999900                          # 示例值，以实际服务返回为准
+        action:
+          type: string
+          nullable: true
+          description: "可选动作提示；如 subscribe_arrival（到货通知登记入口，US-003-S4 → notifications-v1）。"
+          example: "subscribe_arrival"

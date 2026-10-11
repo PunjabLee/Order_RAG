@@ -1,0 +1,123 @@
+openapi: 3.0.3
+info:
+  title: "TradeWise API v1 - 反馈（Feedback）"
+  version: "1.0.0"
+  description: |
+    权威来源：《设计文档.md》DD-7.1 总览表（反馈行：POST /api/v1/feedback，Bearer，message_id 去重，非流式，
+    错误码前缀"—"，FR-013 闭环入口）、DD-7.7（反馈含赞踩/纠错/期望答案）、DD-11.5（回流 schema：
+    POST /feedback + 转人工结果 + 下单后行为信号 → MQ topic feedback.events）、DD-9.8（feedback_event 表：
+    event_id, session_id, message_id, kind, payload_masked, routed_to）。
+
+    红线自查：错误响应含 error_code/trace_id（R-5）；金额不涉及。PII：正文按 DD-5.5 字段级脱敏后入库
+    （payload_masked）。兼容性：只增不改不删（DD-7.1）。
+    示例值治理：全部示例为示例值，以实际服务返回为准（〇.1）。
+    文档缺口：DD-7.1 该行错误码前缀为"—"（未分配前缀），本契约仅使用通用 401/422/429 与 ErrorEnvelope，
+    具体反馈域错误码待冻结评审收口（见 README G-⑤）。
+  x-contract-status: "IT-1.09 冻结预备（frozen-candidate）"
+  x-dd-mapping: "DD-7.1（反馈行）/ DD-7.7 / DD-11.5 / DD-9.8"
+  license:
+    name: "Internal - TradeWise (契约文档随仓库维护，未对外授权)"
+
+servers:
+  - url: https://api.tradewise.example
+    description: "网关基址（示例值，以实际部署为准）"
+
+security:
+  - bearerAuth: []
+
+paths:
+  /api/v1/feedback:
+    post:
+      operationId: submitFeedback
+      summary: "用户反馈提交（赞踩/纠错/期望答案，FR-013 闭环入口）"
+      description: |
+        幂等（DD-7.1）：message_id 去重——同一 message_id + kind 的重复提交返回首次受理结果
+        （同 message_id 改 kind/内容的语义文档未明列，按"message_id 去重"字面实现为整消息幂等，
+        如需多条反馈并存待冻结评审定案，README G-⑤）。
+        回流（DD-11.5）：受理 → MQ topic feedback.events（schema=DD-9.8）→ 数据中台反馈表 →
+        周度标注 → 评测集更新 SOP → 上线门禁。kind=escalate_result 由客服系统内部回流写入，
+        客户端接口不开放该枚举（防伪造评测样本，US-009-S3 闭环走 escalate 契约）。
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/AuthorizationHeader"
+        - $ref: "shared-schemas.yaml#/components/parameters/XRequestIdHeader"
+        - $ref: "shared-schemas.yaml#/components/parameters/XTenantIdHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FeedbackRequest"
+            example:
+              message_id: "3f9a2b7e-示例-uuid"       # 示例值，以实际服务返回为准
+              kind: "correction"
+              expected_answer: "应为¥80,497.00（示例值，以实际服务返回为准）"
+      responses:
+        "202":
+          description: "已受理（异步回流 MQ，DD-11.5；不承诺中台落表即时完成）。"
+          content:
+            application/json:
+              schema:
+                type: object
+                allOf:
+                  - $ref: "shared-schemas.yaml#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        $ref: "#/components/schemas/FeedbackAck"
+        "401":
+          $ref: "shared-schemas.yaml#/components/responses/Err401"
+        "403":
+          $ref: "shared-schemas.yaml#/components/responses/Err403"
+        "422":
+          $ref: "shared-schemas.yaml#/components/responses/Err422"
+        "429":
+          $ref: "shared-schemas.yaml#/components/responses/Err429"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: "与 shared-schemas.yaml components.securitySchemes 同构（本文件本地冗余声明，满足 OpenAPI 3.0 security 引用闭环）。"
+
+  schemas:
+    FeedbackRequest:
+      description: "反馈请求体（DD-7.7：赞踩/纠错/期望答案）。message_id 必填用于去重与溯源（DD-11.5 反馈可溯源，H-12 验收）。"
+      type: object
+      required: [message_id, kind]
+      additionalProperties: false
+      properties:
+        message_id:
+          type: string
+          description: "被反馈的助手消息 ID（对话链 message_id，DD-7.6 同源；去重键）。"
+          example: "3f9a2b7e-示例-uuid"
+        session_id:
+          type: string
+          nullable: true
+          description: "所属会话（DD-9.8 字段；可选，服务端可由 message_id 反查）。"
+        kind:
+          type: string
+          description: "反馈类型（DD-9.8 kind 枚举的客户端子集；escalate_result 为内部回流专用，不开放）。"
+          enum: [up, down, correction]
+        expected_answer:
+          type: string
+          nullable: true
+          description: "期望答案（DD-7.7；kind=correction 时应提供——条件必填由服务端校验，OpenAPI 3.0 不做结构表达，契约测试覆盖）。"
+          maxLength: 2000
+        comment:
+          type: string
+          nullable: true
+          description: "补充说明（落库前按 DD-5.5 脱敏为 payload_masked）。"
+          maxLength: 2000
+    FeedbackAck:
+      type: object
+      required: [event_id, accepted]
+      properties:
+        event_id:
+          type: string
+          description: "反馈事件 ID（DD-9.8 主键，可溯源至中台反馈表）。示例值，以实际服务返回为准。"
+          example: "fbk_01HXAMPLE"
+        accepted:
+          type: boolean
+          description: "受理标记（重放去时也返回 true + 首次 event_id）。"

@@ -1,0 +1,242 @@
+openapi: 3.0.3
+info:
+  title: "TradeWise API v1 - 对话接口（Chat / SSE）"
+  version: "1.0.0"
+  description: |
+    权威来源：《设计文档.md》DD-7.3（SSE 流式对话契约与事件帧）、DD-7.1 总览表（对话行：Bearer+session 绑定、
+    message_id 去重、SSE、RAG- 前缀）、DD-7.2（必填头/错误包）、DD-7.6（message_id TTL 1h / turn_id 单调）、
+    DD-3.3.1（slots 1:1）、DD-3.6.2/3.6.3（citations/fact_check）、DD-6.3（降级必含 degraded=true + price_as_of）、
+    PRD-4.1（首 token ≤1.5s / 完整 ≤5s；8s 未出完整回复先推结构化事实兜底帧再断流）。
+
+    红线自查：
+      - R-2（C-6）：请求体严禁 `context` 对象——上下文为服务端状态，客户端仅可传可选只读指针 `context_ref`（默认省略）；
+      - R-3：金额一律 integer 分（options 帧 price_cents）；
+      - R-4（C-5）：事实类响应必须含 citations 帧与 fact_check 帧（status 必现）；
+      - R-5：流内错误经 error 帧、流外错误经 ErrorEnvelope，均含 error_code/trace_id。
+
+    兼容性（DD-7.1）：只增不改不删；type 枚举收口八值，禁止扩散（H-9①）。
+    示例值治理：本文件示例均为示例值，以实际服务返回为准（设计文档 〇.1）。
+  x-contract-status: "IT-1.09 冻结预备（frozen-candidate）"
+  x-dd-mapping: "DD-7.3（主）/ DD-7.1 / DD-7.2 / DD-7.6 / DD-6.3 / DD-3.6"
+  license:
+    name: "Internal - TradeWise (契约文档随仓库维护，未对外授权)"
+
+servers:
+  - url: https://api.tradewise.example
+    description: "网关基址（示例值，以实际部署为准）；URL 主版本 /v1（DD-7.1）"
+
+security:
+  - bearerAuth: []
+
+paths:
+  /api/v1/chat:
+    post:
+      operationId: chatStream
+      summary: "对话主入口（SSE 流式，读侧，整改 C-4/FR-014）"
+      description: |
+        鉴权（DD-5.2）：GW 验 token → AUTH 校验 → session 与 token 主体绑定校验（不一致 401 + SESSION_OWNER_MISMATCH 审计）。
+        幂等（DD-7.6）：message_id 去重，重放返回首次结果，TTL 1h；turn_id 会话内单调，乱序拒绝（DD-3.2.3）。
+        错误码前缀：RAG-（DD-7.1 总览表）。
+      parameters:
+        - $ref: "shared-schemas.yaml#/components/parameters/AuthorizationHeader"
+        - $ref: "shared-schemas.yaml#/components/parameters/XRequestIdHeader"
+        - $ref: "shared-schemas.yaml#/components/parameters/XTenantIdHeader"
+        - name: Accept
+          in: header
+          required: true
+          description: "固定 text/event-stream（DD-7.3）。"
+          schema:
+            type: string
+            enum: ["text/event-stream"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatRequest"
+            example:
+              session_id: "opaque_uuid_01HXAMPLE"    # 示例值，以实际服务返回为准
+              message_id: "3f9a2b7e-示例-uuid"        # 示例值，以实际服务返回为准
+              turn_id: 7
+              message: "Mac Studio什么价格"
+      responses:
+        "200":
+          description: "SSE 事件流（结构化事实帧优先于文本帧，保证降级可渲染，DD-7.3）。"
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: "SSE 帧序列：event: <name>\\ndata: <json>。帧结构与顺序规则见 x-sse-events / x-sse-protocol。"
+              x-sse-events:
+                meta:
+                  description: "首帧必现：会话/轮次/回复类型/trace_id。"
+                  schema:
+                    $ref: "#/components/schemas/MetaEvent"
+                slots:
+                  description: "槽位快照帧（DD-3.3.1 字段 1:1 + missing_slots + slot_meta）。"
+                  schema:
+                    $ref: "#/components/schemas/SlotsEvent"
+                options:
+                  description: "可点选澄清/替代选项帧（US-003-S4 可含 action=subscribe_arrival）。"
+                  schema:
+                    $ref: "#/components/schemas/OptionsEvent"
+                delta:
+                  description: "文本增量帧（连接语；事实数字由服务端占位符渲染，LLM 仅生成连接语，DD-3.6.1）。"
+                  schema:
+                    $ref: "#/components/schemas/DeltaEvent"
+                citations:
+                  description: "引用帧（红线 R-4：含事实的回复必现，DD-3.6.3）。"
+                  schema:
+                    $ref: "#/components/schemas/CitationsEvent"
+                fact_check:
+                  description: "事实校验帧（红线 R-4：事实类回复必现 status；blocked=拦截模板直出；no_evidence=未找到依据话术）。"
+                  schema:
+                    $ref: "#/components/schemas/FactCheckEvent"
+                done:
+                  description: "尾帧必现：degraded 标记；降级态必含 degraded=true + price_as_of（DD-6.3②）。"
+                  schema:
+                    $ref: "#/components/schemas/DoneEvent"
+                error:
+                  description: "流内错误帧（IT-1.09 按任务卡补充定义；DD-7.3 原示例未含，见 errors-dict.yaml 文档冲突 C-⑤）。承载如 RAG-41001 会话过期、RAG-40901 冲突、SAFE-451 等流建立后错误。"
+                  schema:
+                    $ref: "#/components/schemas/StreamErrorEvent"
+              x-sse-protocol:
+                order: "meta 为首帧，done 为尾帧；结构化事实帧（slots/options/citations/fact_check）优先于 delta 文本帧（DD-7.3）。"
+                fact_rule: "meta.type ∈ {answer, draft_card, order_result, degraded} 且回复含事实数字时：citations 帧与 fact_check 帧必现于 done 之前（红线 R-4 / DD-3.6.3）。"
+                no_evidence_rule: "事实类意图且无任何 citations → fact_check.status=no_evidence，文案为“未找到依据”话术，禁止自由发挥（US-007-S3 / RAG-40402）。"
+                blocked_rule: "事实校验不通过 → 重试 1 次仍不一致 → 拦截并模板直出（正确数字代码拼入），fact_check.status=blocked，记 hallucination.blocked P1（DD-6.1#12、DD-3.6.2）。"
+                degraded_rule: "降级态响应 done.degraded=true 且必含 price_as_of；价格类降级回复不依赖文字描述（DD-6.3②）。"
+                timeout_rule: "8s 未出完整回复 → 先推结构化事实兜底帧再断流（PRD-4.1 / DD-7.3）；首 token ≤1.5s、完整 ≤5s 为分段预算基线（K-5 裁决）。"
+                safe_rule: "内容安全拦截：流已建立时整条替换合规话术并以 fact_check/done 收尾；流建立前命中可返回 HTTP 451（SAFE-451，DD-6.1#18）。"
+        "400":
+          $ref: "shared-schemas.yaml#/components/responses/Err422"
+        "401":
+          $ref: "shared-schemas.yaml#/components/responses/Err401"
+        "409":
+          description: "会话槽位版本冲突 RAG-40901（重拉快照后重试，DD-3.2.3）。"
+          content:
+            application/json:
+              schema:
+                $ref: "shared-schemas.yaml#/components/schemas/ErrorEnvelope"
+        "422":
+          $ref: "shared-schemas.yaml#/components/responses/Err422"
+        "429":
+          $ref: "shared-schemas.yaml#/components/responses/Err429"
+        "451":
+          description: "内容安全拦截（流建立前命中，SAFE-451；整条替换合规话术并审计，DD-6.1#18）。"
+          content:
+            application/json:
+              schema:
+                $ref: "shared-schemas.yaml#/components/schemas/ErrorEnvelope"
+        "503":
+          $ref: "shared-schemas.yaml#/components/responses/Err503"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    ChatRequest:
+      description: |
+        对话请求体（DD-7.3）。字段集收口：session_id / message_id / turn_id / message + 可选 context_ref。
+        additionalProperties:false 结构性拒绝旧版 `context` 对象（整改 C-6②/H-2：上下文为服务端状态；
+        context_ref 为只读指针，默认省略）。任何多余字段（含 context、prompt、system 注入位）→ 422。
+      type: object
+      required: [session_id, message_id, turn_id, message]
+      additionalProperties: false      # 红线 R-2：context 对象严禁出现
+      x-removed-fields:
+        context: "已移除（C-6②）：客户端不可再传上下文对象；服务端状态经 session_id + 可选 context_ref 只读指针引用"
+      properties:
+        session_id:
+          type: string
+          description: "不透明随机会话 ID（DD-5.1 T-SESS：不可猜测）；与 token 主体强绑定校验（DD-5.2）。示例值，以实际服务返回为准。"
+          example: "opaque_uuid_01HXAMPLE"
+        message_id:
+          type: string
+          description: "幂等去重键（uuid），重放返回首次结果，TTL 1h（DD-7.6）。"
+          example: "3f9a2b7e-示例-uuid"
+        turn_id:
+          type: integer
+          minimum: 1
+          description: "会话内单调轮次号；非单调（乱序）拒绝并告警（DD-7.6 / DD-3.2.3）。"
+          example: 7
+        message:
+          type: string
+          minLength: 1
+          maxLength: 4000
+          description: "用户原文。PII 由服务端脱敏后进 trace/LLM（DD-5.5），客户端无需预处理。"
+          example: "Mac Studio什么价格"
+        context_ref:
+          type: string
+          nullable: true
+          description: "可选只读上下文指针（默认省略；DD-7.3 注）。不可用于承载任何上下文内容。"
+          example: "ctxref_示例"       # 示例值，以实际服务返回为准
+
+    MetaEvent:
+      description: "event: meta（DD-7.3 帧示例逐字段对齐）。"
+      type: object
+      required: [session_id, turn_id, type, trace_id]
+      properties:
+        session_id:
+          type: string
+        turn_id:
+          type: integer
+        type:
+          $ref: "shared-schemas.yaml#/components/schemas/ChatResponseType"
+        trace_id:
+          type: string
+          description: "示例值，以实际服务返回为准。"
+          example: "trc_01HZXAMPLE0009"
+
+    SlotsEvent:
+      description: "event: slots（DD-7.3 示例：product/sku/quantity/missing_slots/slot_meta；字段全集按 DD-3.3.1 六槽位，未含字段视为未采集，可空）。"
+      allOf:
+        - $ref: "shared-schemas.yaml#/components/schemas/SlotsFrame"
+
+    OptionsEvent:
+      description: "event: options（DD-7.3 示例逐字段对齐：label/value/price_cents，integer 分）。"
+      type: array
+      items:
+        $ref: "shared-schemas.yaml#/components/schemas/OptionItem"
+
+    DeltaEvent:
+      description: "event: delta（文本增量；数字以服务端占位符渲染结果出现，LLM 不得自写数字，DD-3.6.1）。"
+      type: object
+      required: [text]
+      properties:
+        text:
+          type: string
+          example: "请问您要哪款？"     # 示例值，以实际服务返回为准
+
+    CitationsEvent:
+      description: "event: citations（红线 R-4：事实类回复必现；DD-3.6.3 字段集）。"
+      type: array
+      items:
+        $ref: "shared-schemas.yaml#/components/schemas/Citation"
+
+    FactCheckEvent:
+      description: "event: fact_check（红线 R-4；DD-7.3 示例 {status, checked_facts}）。"
+      allOf:
+        - $ref: "shared-schemas.yaml#/components/schemas/FactCheck"
+
+    DoneEvent:
+      description: "event: done（尾帧；降级态必含 degraded=true + price_as_of，DD-6.3②/K-5）。"
+      type: object
+      required: [degraded]
+      properties:
+        degraded:
+          type: boolean
+          example: false
+        price_as_of:
+          type: string
+          format: date-time
+          nullable: true
+          description: "降级态必现（degraded=true 时非空）；正常态可省略/null。UTC ISO8601（口径同 shared-schemas DateTimeUTC；3.0 下 nullable 须与 type 平级）。"
+
+    StreamErrorEvent:
+      description: "event: error（流建立后错误承载；复用 DD-7.2 错误对象结构，error_code/trace_id 必含，红线 R-5。IT-1.09 补充帧，见 errors-dict 文档冲突 C-⑤）。"
+      allOf:
+        - $ref: "shared-schemas.yaml#/components/schemas/ErrorObject"

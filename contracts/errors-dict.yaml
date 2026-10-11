@@ -1,0 +1,308 @@
+# ============================================================================
+# errors-dict.yaml — 错误码字典（权威来源：设计文档 DD-7.2 枚举 + DD-6.1 十八行异常矩阵逐行收编）
+# 契约冻结预备：任务卡 IT-1.09（frozen-candidate）
+# 兼容规则（DD-7.1）：只增不改不删；废弃码走 Deprecation 头 + 1 个季度过渡。
+# 红线 R-5：所有错误响应必须含 error_code / trace_id（见 shared-schemas.yaml ErrorObject）。
+# 说明：http_status / retryable / degraded 为本字典三必查属性；retry_semantics 补充 DD-6.2 重试总则口径。
+# ============================================================================
+meta:
+  version: "1.0.0"
+  authoritative_sources:
+    - "DD-7.2 通用规范·错误码字典（前缀 RAG-/ORD-/AUTH-/LLM-/SAFE-/GW-；列举 11 例）"
+    - "DD-6.1 异常矩阵 18 行（逐行收编，含矩阵外附注 GW-429）"
+    - "DD-6.2 重试/熔断总则、DD-6.3 降级与交易联动铁律"
+  prefix_declared: ["RAG-", "ORD-", "AUTH-", "LLM-", "SAFE-", "GW-"]
+  http_status_declared_by_dd72: [401, 403, 409, 422, 429, 503]
+  response_envelope: "shared-schemas.yaml#/components/schemas/ErrorEnvelope"
+  audit_note: "标注 audit=true 的事件类型必须落审计（DD-5.5 审计事件清单：登录/越权拒绝/草稿签发与消费/下单各 SAGA 步/补偿触发/降级开关切换/认证状态变更/token 重放；均含 trace_id + user_id + tenant_id）。"
+
+codes:
+
+  # ---------------- RAG-（对话/检索/读侧） ----------------
+  - error_code: RAG-41001
+    title: 会话过期
+    http_status: 410
+    retryable: false
+    degraded: false
+    user_visible: "引导新会话，草稿需重建（DD-6.1#16）"
+    internal_action: "拒绝引用旧槽位"
+    source_ref: "DD-7.2、DD-6.1#16"
+    audit: false
+    note: "文档冲突 C-①：DD-7.2 状态码示例集合（401/403/409/422/429/503）未含 410，本码按号段 410xx 语义映射 410，待架构裁决；会话场景经 SSE error 帧透出时 HTTP 层可为 200（流已建立）。"
+
+  - error_code: RAG-40901
+    title: 槽位版本冲突（会话乐观锁）
+    http_status: 409
+    retryable: true
+    retry_semantics: "重拉快照后可重试（DD-3.2.3：后到者获得冲突并重拉；乱序 turn_id 丢弃并告警）"
+    degraded: false
+    user_visible: "（内部并发控制，通常用户无感）"
+    internal_action: "重拉快照"
+    source_ref: "DD-7.2、DD-3.2.3"
+    audit: false
+
+  - error_code: RAG-40401
+    title: 商品不存在
+    http_status: 404
+    retryable: false
+    degraded: false
+    user_visible: "更正商品指向"
+    internal_action: "澄清/引导重新选择（options 点选）"
+    source_ref: "DD-7.2"
+    audit: false
+    note: "文档冲突 C-①：404 不在 DD-7.2 状态码示例集合内，按号段语义映射，待架构裁决。"
+
+  - error_code: RAG-40402
+    title: 检索空/低置信（无证据）
+    http_status: 404
+    retryable: true
+    retry_semantics: "改写提问可重试"
+    degraded: false
+    user_visible: "“未找到依据”话术（不生成事实性回答，US-007-S3）"
+    internal_action: "fact_check.status=no_evidence"
+    source_ref: "DD-6.1#13、DD-3.6.3"
+    audit: false
+    metric: "无证据率"
+    note: "文档冲突 C-①：404 不在 DD-7.2 示例集合内；对话链路实际以 SSE 帧（type=no_match + fact_check=no_evidence）承载，非 HTTP 404。"
+
+  - error_code: RAG-42201
+    title: 数量超限购
+    http_status: 422
+    retryable: false
+    degraded: false
+    user_visible: "提示上限并引导修改数量"
+    internal_action: "槽位校验拒绝写回（DD-3.3.1：1 ≤ q ≤ min(限购上限, 单笔预算上限)）"
+    source_ref: "DD-7.2、DD-3.3.1"
+    audit: false
+
+  - error_code: RAG-50301
+    title: 商品服务 5xx/超时
+    http_status: 503
+    retryable: true
+    retry_semantics: "重试 1 次（指数退避 200ms 起，仅读操作，DD-6.2/DD-3.5.2）→ 熔断 → KB 降级"
+    degraded: true
+    user_visible: "参考价 + price_as_of + 可能过期标注（DD-6.1#1）"
+    internal_action: "KB 降级；降级态禁草稿/禁下单（DD-6.3）"
+    source_ref: "DD-6.1#1"
+    audit: false
+    metric: "degraded_rate P2 告警"
+
+  - error_code: RAG-50302
+    title: 促销试算失败
+    http_status: 503
+    retryable: true
+    retry_semantics: "重试 1 次 → 禁草稿"
+    degraded: true
+    user_visible: "“暂无法试算” + 原价"
+    internal_action: "禁草稿（DD-6.3 铁律）"
+    source_ref: "DD-6.1#2"
+    audit: false
+    metric: "degraded_rate P2 告警"
+
+  - error_code: RAG-50303
+    title: 物流试算失败
+    http_status: 503
+    retryable: true
+    retry_semantics: "重试 1 次 → 禁草稿（禁进入价格类确认）"
+    degraded: true
+    user_visible: "“暂无法确认交期”"
+    internal_action: "禁草稿"
+    source_ref: "DD-6.1#3"
+    audit: false
+    metric: "degraded_rate P2 告警"
+
+  # ---------------- ORD-（交易/草稿/订单） ----------------
+  - error_code: ORD-40901
+    title: 草稿过期
+    http_status: 409
+    retryable: false
+    retry_semantics: "不可原样重试：需重建草稿（expires_at = created_at + 15min，与预占/锁券 TTL 对齐，DD-4.4/DD-7.4）"
+    degraded: false
+    user_visible: "引导重新发起草稿确认卡片"
+    internal_action: "草稿置 EXPIRED（DD-9.3）"
+    source_ref: "DD-7.2、DD-7.4"
+    audit: true
+
+  - error_code: ORD-40902
+    title: 金额变化需重确认
+    http_status: 409
+    retryable: false
+    retry_semantics: "服务端重算金额与 amount_hash 比对不一致触发（DD-7.5/DD-3.3.3）；用户对新草稿重新确认后方可再次下单"
+    degraded: false
+    user_visible: "展示变化明细并请求重新确认"
+    internal_action: "拒绝消费 token；签发新草稿快照"
+    source_ref: "DD-7.2、DD-7.5、DD-3.3.3"
+    audit: true
+
+  - error_code: ORD-40903
+    title: 降级态禁交易
+    http_status: 503
+    retryable: true
+    retry_semantics: "后端连续 10 次探测成功恢复后可行（DD-6.3④；默认开关 degrade.block_trade=true，DD-6.3①）"
+    degraded: true
+    user_visible: "仅允许浏览与留资；提示稍后再试"
+    internal_action: "禁止创建草稿/禁止下单（DD-6.3①）"
+    source_ref: "DD-7.2、DD-6.3、DD-6.1（附）"
+    audit: true          # 降级开关切换属审计事件清单（DD-5.5）
+    note: "文档冲突 C-②：ORD-409 号段暗示 409，但成因是服务端降级态（可 Retry-After），本字典取 503，待架构裁决收口。"
+
+  - error_code: ORD-40904
+    title: 幂等冲突（同 Idempotency-Key 异请求体）
+    http_status: 409
+    retryable: false
+    retry_semantics: "同 key 同体=重放（返回首次结果，非错误）；同 key 异体=本冲突，须换 key 或还原请求体（DD-4.3）"
+    degraded: false
+    user_visible: "拒绝并提示（DD-6.1#15）"
+    internal_action: "409（DD-6.1#15 显式标注）；重放尝试计数"
+    source_ref: "DD-7.2、DD-6.1#15、DD-4.3"
+    audit: true          # token 重放/越权类事件入审计（DD-5.5）
+    metric: "重放尝试数"
+
+  - error_code: ORD-40905
+    title: 认证失效作废草稿
+    http_status: 409
+    retryable: false
+    retry_semantics: "企业认证过期/撤销事件驱动作废旧草稿与 pending 优惠展示（DD-5.4/DD-7.4）；重新认证后重建草稿"
+    degraded: false
+    user_visible: "提示认证状态，不展示金额（DD-5.4 审核中口径）"
+    internal_action: "事件驱动作废草稿（INVALIDATED）"
+    source_ref: "DD-7.2、DD-5.4、DD-7.4"
+    audit: true          # 认证状态变更属审计事件清单（DD-5.5）
+
+  - error_code: ORD-40910
+    title: 库存预占失败
+    http_status: 409
+    retryable: false
+    retry_semantics: "SAGA 步2 失败：逆序补偿（无已成步骤）；走替代推荐/补货时间路径（DD-6.1#4）"
+    degraded: false
+    user_visible: "替代 SKU 推荐或到货通知登记入口（US-003-S4）"
+    internal_action: "补偿链（DD-4.2）"
+    source_ref: "DD-6.1#4"
+    audit: true          # 补偿触发属审计事件（DD-5.5）
+    metric: "预占失败率"
+
+  - error_code: ORD-40911
+    title: 锁券失败（预占已成功）
+    http_status: 409
+    retryable: false
+    retry_semantics: "释放预占 → 重算并展示可用优惠（DD-6.1#5、DD-4.2 步3 补偿=退回券/释放预占必执行）"
+    degraded: false
+    user_visible: "重算并展示可用优惠"
+    internal_action: "释放预占 → 重算"
+    source_ref: "DD-6.1#5"
+    audit: true
+    metric: "补偿成功率"
+
+  - error_code: ORD-50401
+    title: 订单写超时（结果未知）
+    http_status: 504
+    retryable: false
+    retry_semantics: "禁止盲重试：凭 order_txn_id 重查，仍未知入对账队列（DD-6.1#6、DD-4.3、DD-6.2）"
+    degraded: false
+    user_visible: "“处理中，请稍候” + 禁用重复提交"
+    internal_action: "重查 → 对账"
+    source_ref: "DD-6.1#6"
+    audit: true
+    metric: "unknown_result_txn P1 告警"
+    note: "文档冲突 C-①：504 不在 DD-7.2 状态码示例集合内，按号段语义映射，待架构裁决。"
+
+  - error_code: ORD-41001
+    title: 支付超时/未支付悬挂（定时关单）
+    http_status: 410
+    retryable: false
+    degraded: false
+    user_visible: "订单取消通知"
+    internal_action: "TTL 扫描 → 定时关单 → 释库存 → 退券（DD-4.4）；异步事件，通常不以 HTTP API 响应返回（经通知/订单查询状态体现）"
+    source_ref: "DD-6.1#7"
+    audit: true
+    metric: "orphan_reservations P2 告警"
+    note: "文档冲突 C-①：410 不在 DD-7.2 示例集合内；本码为内部生命周期事件码，映射待架构确认。"
+
+  # ---------------- AUTH- ----------------
+  - error_code: AUTH-40302
+    title: 地址归属越权
+    http_status: 403
+    retryable: false
+    degraded: false
+    user_visible: "拒绝并要求重选本人地址"
+    internal_action: "越权拒绝 + 审计（DD-5.5）；五类越权用例之一（DD-7.5 安全测试矩阵：传入他人 address_id）"
+    source_ref: "DD-7.2、DD-3.3.1、DD-7.5 安全矩阵"
+    audit: true
+    note: "文档缺项：token 无效（401）与 session 归属不一致（DD-5.2 SESSION_OWNER_MISMATCH 401）尚无分配错误码，冻结评审前需补 AUTH-401xx 收码。"
+
+  # ---------------- LLM- / NLU- ----------------
+  - error_code: LLM-503
+    title: LLM 主模型超时/限流
+    http_status: 503
+    retryable: true
+    retry_semantics: "切备用 → 重试 1 次 → 模板直出（DD-6.1#10、DD-3.5.2 错误率>5%/1min 切备用）"
+    degraded: true
+    user_visible: "等待或备用（话术三级降级链 DD-6.4）"
+    internal_action: "模型网关切换"
+    source_ref: "DD-6.1#10"
+    audit: true          # 降级开关切换属审计事件
+    metric: "切换事件 P2 告警"
+
+  - error_code: NLU-502
+    title: LLM 结构化输出解析失败
+    http_status: 502
+    retryable: false
+    retry_semantics: "走降级链：小模型结果或澄清（DD-6.1#11），不重放原请求"
+    degraded: true
+    user_visible: "走小模型结果或澄清"
+    internal_action: "降级链"
+    source_ref: "DD-6.1#11"
+    audit: false
+    metric: "parse_fail"
+    note: "文档冲突 C-③：前缀 NLU- 不在 DD-7.2 六前缀（RAG-/ORD-/AUTH-/LLM-/SAFE-/GW-）清单内；502 亦不在状态示例集合。保留原码并升级为契约变更评审项（建议收编为 LLM- 前缀）。"
+
+  # ---------------- SAFE- ----------------
+  - error_code: SAFE-451
+    title: 内容安全拦截
+    http_status: 451
+    retryable: false
+    degraded: true
+    user_visible: "整条替换合规话术（DD-6.1#18）"
+    internal_action: "拦截事件审计落库；SAFE 位于响应返回主链路（DD-5.1 T-SAFE）"
+    source_ref: "DD-7.2、DD-6.1#18"
+    audit: true
+    metric: "拦截率"
+    note: "文档冲突 C-①：451 不在 DD-7.2 示例集合内（451 亦非通用 HTTP 语义位），按码号 451 映射，待架构裁决；对话链路中拦截以 SSE 帧内整条替换承载（流已建立时 HTTP 200）。"
+
+  # ---------------- GW- ----------------
+  - error_code: GW-429
+    title: 网关限流命中
+    http_status: 429
+    retryable: true
+    retry_semantics: "HTTP 429 + Retry-After；排队提示（DD-6.1 附注）；网关+会话双级限流（DD-5.1 T-ABUSE）"
+    degraded: false
+    user_visible: "排队提示"
+    internal_action: "限流拒绝"
+    source_ref: "DD-6.1 附注、DD-7.2"
+    audit: false
+
+  # ---------------- LOGI-（正文出现，前缀待收口） ----------------
+  - error_code: LOGI-42201
+    title: 地址不可达（物流试算拒绝）
+    http_status: 422
+    retryable: false
+    degraded: false
+    user_visible: "提示更换地址（DD-2 US-003 异常处理）"
+    internal_action: "可达性预检失败（DD-3.3.1 address_id 校验）"
+    source_ref: "DD-2（US-003 异常处理行）"
+    audit: false
+    note: "文档冲突 C-④：前缀 LOGI- 不在 DD-7.2 六前缀清单内，属正文散现码；本字典仅收编存档，是否改名（如 RAG-42202）待架构评审收口，禁止实现方自行扩散该前缀。"
+
+# ============================================================================
+# 文档冲突/缺项汇总（供 IT-1.09 冻结评审裁决，不自行改设计）
+x-document-conflicts:
+  - id: C-①
+    summary: "DD-7.2 声明的 HTTP 状态码示例集合（401/403/409/422/429/503）小于码号段自然语义所需（404/410/422/502/504/451）；本字典按号段+场景映射并逐码标注，待架构裁决统一。"
+  - id: C-②
+    summary: "ORD-40903（降级态禁交易）号段暗示 409，但成因是服务端降级态（DD-6.3），409/503 二义。本字典取 503。"
+  - id: C-③
+    summary: "NLU-502（DD-6.1#11）与 LOGI-42201（DD-2 正文）前缀不在 DD-7.2 六前缀枚举内，存在前缀收口破口。"
+  - id: C-④
+    summary: "DD-5.2 的 SESSION_OWNER_MISMATCH（401+审计）与通用 token 无效无分配错误码；AUTH- 前缀目前仅 AUTH-40302 一例。"
+  - id: C-⑤
+    summary: "DD-7.3 事件帧示例序列未包含 error 帧；任务卡 IT-1.09 与 DD-7.2 错误包要求流内错误承载，本契约以 x-sse-events.error 补充定义（复用 ErrorObject，红线 R-5 满足），不改变 DD-7.3 既有七帧结构。"

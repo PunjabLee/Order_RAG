@@ -1,4 +1,4 @@
-# IT-1.11 · CI 基线流水线（工程骨架四步 + 后续任务槽位）
+# IT-1.11 · CI 基线流水线（七步卡口：骨架四步 + 评审修复补齐 Gate 5~7）
 #
 # 平台说明：本文件为 GitHub Actions 语法。若实际平台为 GitLab CI / Jenkins，
 # 请保持同名四步的等价阶段（返回码非 0 即阻断），并更新本注释（scripts/ci/README.md §与流水线的关系）。
@@ -24,7 +24,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      # ── 步骤 1/4：commit-msg 校验（对范围提交，§8.3 硬约束①） ──────────────
+      # ── 步骤 1/7：commit-msg 校验（对范围提交，§8.3 硬约束①） ──────────────
       - name: Gate 1 · commit message convention (range)
         env:
           BASE_REF: ${{ github.base_ref }}
@@ -41,25 +41,40 @@ jobs:
           echo "校验提交范围: $RANGE"
           python3 scripts/ci/check_commit_msg.py --range "$RANGE"
 
-      # ── 步骤 2/4：mermaid 围栏/语法头检查（附录 D，L-3） ────────────────────
+      # ── 步骤 2/7：mermaid 围栏/语法头检查（附录 D，L-3） ────────────────────
       - name: Gate 2 · mermaid fence & header check
         run: python3 scripts/ci/check_mermaid.py --root .
 
-      # ── 步骤 3/4：DD-8.1 金额独立复算 + 设计文档基线比对 ────────────────────
+      # ── 步骤 3/7：DD-8.1 金额独立复算 + 设计文档基线比对 ─────────────────────
       - name: Gate 3 · amount recalculation (DD-8.1)
         run: python3 scripts/ci/recalc_amount.py
 
-      # ── 步骤 4/4：单元自测（单测框架种子，DD-13 单元层） ────────────────────
+      # ── 步骤 4/7：单元自测（单测框架种子，DD-13 单元层） ────────────────────
       - name: Gate 4 · unit self-tests (stdlib unittest)
         run: python3 -m unittest discover -s scripts/ci/tests -v
 
-      # ══ 预留槽位（本卡只声明，不实现；触发任务见注释） ══════════════════════
-      # TODO: IT-1.09 —— 契约 lint：spectral/oadg lint contracts/*.yaml（含 SSE 事件帧、
-      #   错误码字典、金额分单位），起 mock server，前端/交易双消费者契约测试；
-      #   §8.4：contracts 变更需触发消费者契约重跑 + 兼容性声明。
-      # TODO: IT-2.05 —— 评测集回归：eval/golden-set-v1（≥200 条标注）Recall@5 ≥ 0.9 /
-      #   政策命中 ≥ 0.95 / 幻觉率门禁（DD-13 RAG 离线评测层，§8.3 卡口"评测集回归自 IT-2.05 起接入"）。
-      # TODO: IT-2.x —— 业务单测/契约测试并入本 Gate 4（目录约定 tests/ + discover，夹具来自 IT-1.07）。
-      # TODO: IT-3.09 —— DLP 扫描卡口（凭据/PII，§8.2 禁止项；gitleaks 类工具 + 自研 PII 规则）。
-      # TODO: 附录 D 完整渲染 —— mermaid-cli（@mermaid-js/mermaid-cli）headless 渲染
-      #   *.md 中全部图至 SVG 并断言零渲染错误；依赖 Node 工具链，待运维排期确认。
+      # ── 步骤 5/7：评测集结构回归（评审 H-1 补位；语义指标回归仍留 IT-2.05） ────
+      - name: Gate 5 · eval golden-set schema check
+        run: python3 eval/metrics/validate_schema.py
+
+      # ── 步骤 6/7：契约 lint（§8.3"MR 必过"补位，评审 H-1/L-1；口径 redocly.yaml） ──
+      - name: Setup node (for redocly-cli)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Gate 6 · OpenAPI lint (redocly)
+        run: npx --yes @redocly/cli lint $(ls contracts/*.yaml | grep -v 'redocly.yaml')
+
+      # ── 步骤 7/7：DLP 最小实现（凭据/密钥；PII 自研规则扩展留 IT-3.09） ────────
+      - name: Gate 7 · DLP scan (gitleaks)
+        run: |
+          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.21.2 \
+            detect --source=/repo -v --redact --no-banner || {
+            echo "::error::DLP 检出入库凭据/密钥（§8.2 禁止项），阻断合入"; exit 1; }
+
+      # ══ 仍预留的槽位（依赖外部条件，触发任务见注释） ════════════════════════
+      # TODO: IT-1.09 冻结评审 —— mock server 起服 + 前端/交易双消费者契约测试（L-05 解欠前置）。
+      # TODO: IT-2.05 —— 评测语义回归：Recall@5 ≥ 0.9 / 政策命中 ≥ 0.95 / 幻觉率门禁（需检索链路）。
+      # TODO: IT-2.x —— 业务单测/契约测试并入 Gate 4（目录约定 tests/ + discover，夹具来自 IT-1.07）。
+      # TODO: IT-3.09 —— DLP 扩展自研 PII 规则（手机号/身份证/地址精确，DD-5.5 口径）。
+      # TODO: 附录 D 完整渲染 —— mermaid-cli（@mermaid-js/mermaid-cli）headless 渲染全部图至 SVG，待运维排期。

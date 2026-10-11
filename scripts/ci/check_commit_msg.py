@@ -53,6 +53,13 @@ TASK_OK_RE = re.compile(r"^Task:[ \t]+IT-\d+\.\d+(?:[ \t]+\[Q\d+\])?[ \t]*$", re
 # 白名单理由：v2.2-baseline 之前的文档基线提交产生于任务卡体系（§1/§8.3）建立之前，
 # 无法回溯任务 ID；此后新提交一律走 Task: IT-x.xx。
 TASK_NA_RE = re.compile(r"^Task:[ \t]+N/A(?P<inline>[：:][ \t]*\S.*)?[ \t]*$", re.M)
+# 白名单收敛（评审 M-4）：N/A 需显式 `Baseline:` trailer；历史豁免＝已核准提交登记表（含双 Task 遗留）
+BASELINE_RE = re.compile(r"^Baseline:[ \t]+\S+", re.M)
+LEGACY_EXEMPT_COMMITS = {
+    "90d894c": "N/A 无 Baseline trailer（AGENTS.md 初始化，收敛规则前提交，追认）",
+    "942367c": "N/A 无 Baseline trailer（post-commit 钩子，收敛规则前提交，追认）",
+    "28d0001": "双 Task trailer（状态回写覆盖 IT-1.09/1.11，多 Task 拒绝规则前提交，追认）",
+}
 REASON_RE = re.compile(r"^Reason:[ \t]+\S.{2,}$", re.M)
 # 豁免白名单 2：机器生成/中间态提交——
 #   Merge*：平台或 --no-ff 合并自动生成，非人工撰写，合入 squash（§8.3④）后主线不保留；
@@ -75,7 +82,7 @@ def _clean_lines(text: str) -> list[str]:
     return lines
 
 
-def validate_message(text: str) -> tuple[list[str], list[str]]:
+def validate_message(text: str, commit: str | None = None) -> tuple[list[str], list[str]]:
     """返回 (errors, warnings)。errors 非空即应拒绝。"""
     errors: list[str] = []
     warnings: list[str] = []
@@ -129,25 +136,34 @@ def validate_message(text: str) -> tuple[list[str], list[str]]:
     if rest and lines[first + 1].strip():
         errors.append("标题与正文之间必须空一行（trailer 解析依赖此结构）")
 
-    # --- Task trailer（硬约束①）---
+    # --- Task trailer（硬约束①；N/A 白名单收敛，评审 M-4）---
     body = "\n".join(lines)
+    legacy = (commit or "")[:7] in LEGACY_EXEMPT_COMMITS
     if not TASK_OK_RE.search(body):
         na = TASK_NA_RE.search(body)
         if not na:
             errors.append(
                 "缺少 `Task: IT-x.xx` trailer（§8.3 硬约束①）。豁免通道："
                 "① Merge/Revert/fixup!/squash! 前缀自动豁免；"
-                "② 初始 docs 基线可用 `Task: N/A: <理由>`（须写明理由，白名单见脚本头注释）"
+                "② 基线序列遗留提交可用 `Task: N/A: <理由>` + `Baseline: <tag|hash>` 显式标记"
+                "（CI 范围模式另认历史豁免登记表 LEGACY_EXEMPT_COMMITS）"
             )
         elif not (na.group("inline") or REASON_RE.search(body)):
             errors.append(
                 "`Task: N/A` 必须附理由：同行 `Task: N/A: <理由>` 或正文 `Reason: <理由>`"
-                "（仅限初始 docs 基线类提交）"
+                "（仅限基线类提交）"
+            )
+        elif not (BASELINE_RE.search(body) or legacy):
+            errors.append(
+                "`Task: N/A` 需显式 `Baseline: <tag|hash>` trailer（§8.3 白名单收敛，评审 M-4）；"
+                "新提交一律走 `Task: IT-x.xx`"
             )
         else:
-            warnings.append("Task: N/A 走白名单（初始文档基线），请确认确属该场景")
-    if body.count("Task:") > 1:
-        warnings.append("出现多条 `Task:` trailer：一任务一提交，跨任务请拆分（§8.3 ④）")
+            warnings.append("Task: N/A 经 Baseline trailer/历史豁免登记放行，请确认确属基线序列提交")
+    if body.count("Task:") > 1 and not legacy:
+        errors.append(
+            "出现多条 `Task:` trailer：一任务一提交，跨任务请拆分（§8.3 ④，已升级为拒绝，评审 M-4）"
+        )
 
     # --- Refs trailer（§8.3 模板项，非硬约束 → 告警）---
     if not re.search(r"^Refs:[ \t]+\S", body, re.M):
@@ -176,12 +192,12 @@ def check_range(rev_range: str) -> int:
     rc = 0
     for sha in shas:
         msg = _git("show", "-s", "--format=%B", sha)
-        rc |= _report(sha[:10], msg, quiet_ok=True)
+        rc |= _report(sha[:10], msg, quiet_ok=True, commit=sha)
     return rc
 
 
-def _report(label: str, msg: str, quiet_ok: bool = False) -> int:
-    errors, warnings = validate_message(msg)
+def _report(label: str, msg: str, quiet_ok: bool = False, commit: str | None = None) -> int:
+    errors, warnings = validate_message(msg, commit=commit)
     for w in warnings:
         print(f"[check-commit-msg] ⚠ {label}: {w}", file=sys.stderr)
     if errors:
@@ -204,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.rev_range:
         return check_range(args.rev_range)
     if args.rev:
-        return _report(args.rev[:10], _git("show", "-s", "--format=%B", args.rev))
+        return _report(args.rev[:10], _git("show", "-s", "--format=%B", args.rev), commit=args.rev)
     if args.msg_file:
         return check_file(args.msg_file)
     ap.error("需要 <MSG_FILE> 或 --range/--rev")

@@ -43,13 +43,16 @@ python3 scripts/ci/recalc_amount.py                     # 金额复算 + 文档�
 
 ## 与流水线的关系
 
-`.github/workflows/ci.yaml`（GitHub Actions 语法）按序执行：commit-msg 范围校验 →
-mermaid 检查 → 金额复算 → 单元自测；契约 lint（IT-1.09）、评测集回归（IT-2.05）、
-DLP（IT-3.09）为声明的 TODO 槽位。**GitLab CI / Jenkins 用户**：将上述四步映射为
-四个 script 阶段即可，卡口语义（返回码非 0 阻断）不变；§8.2 `develop` 保护要求
-"CI 绿"即指本流水线。
+`.github/workflows/ci.yaml`（GitHub Actions 语法）按序执行七步：commit-msg 范围校验 →
+mermaid 检查 → 金额复算 → 单元自测 → 评测集结构回归（validate_schema.py）→
+契约 lint（redocly，Gate 6，评审 H-1 补位）→ DLP 凭据扫描（gitleaks，Gate 7 最小实现）；
+评测语义回归（IT-2.05）、双消费者契约测试（IT-1.09 冻结）、PII 自研规则（IT-3.09）仍为
+声明的 TODO 槽位。**GitLab CI / Jenkins 用户**：将上述七步映射为 script 阶段即可，卡口语义
+（返回码非 0 阻断）不变；§8.2 `develop` 保护要求"CI 绿"即指本流水线。
 
 ## 边界（本目录刻意不做的事）
+
+- `recalc_amount.py` 属"命中模式的字面量一致性"校验：若文档删除全部金额锚点导致 0 命中，仍判通过（无法抓"基线缺失"）；锚点存在性强断言随 IT-1.07 夹具定稿增强（评审 L-2）。
 
 - mermaid 检查是**围栏/语法头/换行标记**级前置校验，非 headless 渲染（渲染级检查与
   `mermaid-cli` 引入在 ci.yaml `TODO: 完整渲染` 槽位声明，待工具链预算确认）；

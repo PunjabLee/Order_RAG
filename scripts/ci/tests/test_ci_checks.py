@@ -66,13 +66,25 @@ class TestCommitMsg(unittest.TestCase):
 
     def test_na_requires_reason(self):
         self.assert_reject("docs(docs): 基线\n\nTask: N/A\n")
-        self.assert_ok("docs(docs): 初始基线\n\nTask: N/A: v2.2-baseline 文档基线先于任务卡体系\n")
+        # 白名单收敛（评审 M-4）：N/A 除理由外须显式 `Baseline:` trailer，否则拒绝
+        self.assert_reject("docs(docs): 初始基线\n\nTask: N/A: v2.2-baseline 文档基线先于任务卡体系\n")
+        self.assert_ok(
+            "docs(docs): 初始基线\n\nTask: N/A: v2.2-baseline 文档基线先于任务卡体系\n"
+            "Baseline: v2.2-baseline\n"
+        )
 
-    def test_multiple_task_trailer_warns(self):
-        errors, warnings = check_commit_msg.validate_message(
-            "feat(chat): a\n\nTask: IT-1.11\nTask: IT-1.09\n")
+    def test_na_legacy_commit_exemption(self):
+        # 历史豁免登记表（CI 范围模式）：收敛规则前的已核准提交追认放行
+        errors, _ = check_commit_msg.validate_message(
+            "docs(repo): AGENTS.md\n\nTask: N/A: 工程配置，无对应任务卡\n", commit="90d894c1234")
         self.assertEqual(errors, [])
-        self.assertTrue(any("多条" in w for w in warnings))
+
+    def test_multiple_task_trailer_rejected(self):
+        # 多 Task 由告警升级为拒绝（评审 M-4）
+        self.assert_reject("feat(chat): a\n\nTask: IT-1.11\nTask: IT-1.09\n")
+        errors, _ = check_commit_msg.validate_message(
+            "docs(plan): 回写\n\nTask: IT-1.11\nTask: IT-1.09\n", commit="28d00011234")
+        self.assertEqual(errors, [])  # 历史豁免登记追认
 
 
 class TestMermaid(unittest.TestCase):

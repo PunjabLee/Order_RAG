@@ -54,8 +54,23 @@ FILES = {
 }
 TRAP_TAG = "过期陷阱"
 TRAP_MIN = {"B2": 15}
-ANCHOR_TOTAL_CENTS = 8049700          # DD-8.1 权威声明值
-ANCHOR_UNIT, ANCHOR_QTY = 2999900, 3
+# DD-8.1 锚点值单一来源＝scripts/ci/pricing_baseline.json（假设值挂 Q1/Q7；禁第二数据源，评审 M-3）
+def _load_anchor_baseline():
+    import json
+    import os
+    cfg_path = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir,
+        "scripts", "ci", "pricing_baseline.json"))
+    try:
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = json.load(f)
+        return int(cfg["unit_price_cents"]), int(cfg["quantity"]), int(cfg["expected_total_cents"])
+    except Exception:
+        # 兜底＝与配置源 2026-10-11 基线同值（Q7 假设值；回填后必须以配置源为准，禁此处漂移）
+        return 2999900, 3, 8049700
+
+
+ANCHOR_UNIT, ANCHOR_QTY, ANCHOR_TOTAL_CENTS = _load_anchor_baseline()  # DD-8.1 示例链：3×¥29,999→9折→−¥500
 DD81_TOLERANCE_CENTS = 100            # 非锚点场景仅允许因取整产生的 ≤1 元尾差（且须 Q7）
 BATCHES_REQUIRING_ASSUMPTION_TAG = {"B1", "B2", "B3", "B4"}
 FIX_PRICING_VERSION = "pv_20261011_0930"      # 夹具中的假设价格/政策快照版本

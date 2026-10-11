@@ -6,8 +6,8 @@ set -eu
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
-chmod +x .githooks/commit-msg
+chmod +x .githooks/commit-msg .githooks/post-commit
 git config core.hooksPath .githooks
 
 echo "[install-hooks] core.hooksPath = $(git config --get core.hooksPath)  (repo: $ROOT)"
-echo "[install-hooks] 完成。commit-msg 卡口生效：规范见《研发迭代计划.md》§8.3"
+echo "[install-hooks] 完成。commit-msg 卡口（规范见《研发迭代计划.md》§8.3）与 post-commit 自动推送（NO_AUTO_PUSH=1 可临时关闭）均生效"

@@ -1,1 +1,31 @@
-/.idea/
+# .gitignore — 基于RAG电商智能对话下单系统
+
+# IDE（IDEA 个人配置不入库；如需共享 runConfigurations 再单独放行）
+.idea/
+*.iml
+
+# OS
+.DS_Store
+
+# 本地环境与密钥（严禁提交任何凭据/连接串）
+.env
+.env.*
+*.local
+secrets/
+*.pem
+*.key
+
+# 构建与依赖（代码仓建立后按栈补充）
+build/
+dist/
+out/
+node_modules/
+__pycache__/
+*.pyc
+target/
+vendor/
+
+# 日志与临时
+*.log
+tmp/
+.cache/

@@ -32,8 +32,9 @@ python3 -m unittest discover -s scripts/ci/tests    # CI 脚本单测（23 项�
 ## 4. 提交与分支规范（详见计划 §8）
 
 - 分支模型：`main`（保护，仅 release/hotfix 合入打 tag）→ `develop`（迭代集成）→ `feature/IT-x.xx-<简述>`（一任务一分支）；契约走 `contracts/*` 双人 Approve 专道。
-- 提交格式：`<type>(<scope>): <描述>`，正文必携 `Task: IT-x.xx`（工程化配置可用 `Task: N/A: <理由>` 白名单）与 `Refs: <DD/PRD 章节或 US 用例>`。
+- 提交格式：`<type>(<scope>): <描述>`，正文必携行首 `Task: IT-x.xx`（行首多行 `Task:` 拒绝；基线遗留提交用 `Task: N/A: <理由>` + `Baseline: <tag|hash>` 双尾注白名单）与 `Refs: <DD/PRD 章节或 US 用例>`。
 - 合入 squash，主线保持"1 任务 ≈ 1 提交"；代码/文档/格式化分提交。
+- **迭代交付自动评审**（计划 §7）：迭代编码全部提交后、合入 develop 前、门禁评审前，各须派发 CodeReview 子代理评审（完整性/正确性/影响面），产出含问题编号/等级/定位/修正/验收；缺陷 fix/docs 分提交回写 §9 台账并在 MR 关联提交号。
 - **禁止**：直推 main、`--no-verify` 跳钩子、提交凭据或未脱敏 PII。
 
 ## 5. Agent 编制（`.qoder/agents/`，随仓共享）
@@ -54,6 +55,7 @@ python3 -m unittest discover -s scripts/ci/tests    # CI 脚本单测（23 项�
 4. **PII 脱敏**：样本与日志按 DD-5.5 口径（`138****0000`、地址留区县级）。
 5. **降级禁交易**（DD-6.3 铁律）：降级态创建订单请求一律 ORD-40903 拒绝。
 6. **依赖未闭环不阻塞读侧**：Q1~Q5 结论前禁止交易链路合码，读侧开发可先行（计划 §0 并行说明）。
+7. **评审门禁（计划 §7 自动评审机制）**：评审未闭环不得拉 `release/*`；未修复的 High 及以上缺陷不得降级为待办后合入；禁 `--no-verify`。
 
 ## 7. 目录结构
 

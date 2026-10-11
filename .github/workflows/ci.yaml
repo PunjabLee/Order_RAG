@@ -63,7 +63,13 @@ jobs:
         with:
           node-version: "20"
       - name: Gate 6 · OpenAPI lint (redocly)
-        run: npx --yes @redocly/cli lint $(ls contracts/*.yaml | grep -v 'redocly.yaml')
+        run: |
+          # errors-dict.yaml 非 OpenAPI 规格（号段叙述字典），不进 redocly 清单，单独做 YAML 语法校验
+          npx --yes @redocly/cli lint \
+            contracts/chat-v1.yaml contracts/orders-v1.yaml contracts/sessions-v1.yaml \
+            contracts/feedback-v1.yaml contracts/escalate-v1.yaml contracts/notifications-v1.yaml \
+            contracts/shared-schemas.yaml
+          npx --yes js-yaml contracts/errors-dict.yaml > /dev/null && echo "errors-dict.yaml 语法 OK"
 
       # ── 步骤 7/7：DLP 最小实现（凭据/密钥；PII 自研规则扩展留 IT-3.09） ────────
       - name: Gate 7 · DLP scan (gitleaks)

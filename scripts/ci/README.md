@@ -1,0 +1,57 @@
+# scripts/ci — CI 工程骨架（IT-1.11）
+
+流水线四步卡口的本地实现与运行方法。权威依据：《研发迭代计划.md》§8.2/§8.3/§8.4、
+《设计文档.md》DD-13（测试分层）、附录 D（mermaid 渲染检查 L-3）、DD-8（金额规范）。
+
+## 脚本清单
+
+| 脚本 | 用途 | 本地运行 |
+|------|------|---------|
+| `check_commit_msg.py` | 提交信息校验：Conventional Commits + `Task: IT-x.xx` trailer（§8.3 硬约束①） | `python3 scripts/ci/check_commit_msg.py <MSG_FILE>`；CI 范围模式 `--range origin/develop..HEAD` |
+| `.githooks/commit-msg`（仓库根） | commit-msg 钩子包装，调用上述校验器 | 由钩子自动触发，勿手工调用 |
+| `install-hooks.sh` | 安装钩子：`git config core.hooksPath .githooks`（仅仓库级 config） | `sh scripts/ci/install-hooks.sh` |
+| `check_mermaid.py` | 扫描 `*.md`：``` 围栏配对（奇数报错）、mermaid 语法头识别（flowchart/graph/stateDiagram/sequenceDiagram）、块内字面 `\n`（附录 D L-3 要求 `<br/>`）；输出文件+围栏号+行号 | `python3 scripts/ci/check_mermaid.py`（默认全仓，可传文件/目录参数） |
+| `recalc_amount.py` | 按 DD-8.1 独立复算示例金额（纯整数分）并 grep 设计文档 `total_cents`/展示值/减法链比对，不一致即报 | `python3 scripts/ci/recalc_amount.py`；`--no-doc` 只复算 |
+| `pricing_baseline.json` | 复算基线参数（单价分/数量/折扣bp/券分/叠加顺序/舍入步长）。**全部为假设值，挂 Q1/Q7，禁止业务代码硬编码（DD-16 R-07）**；IT-1.07 联调后替换 | 被 `recalc_amount.py` 默认读取 |
+| `tests/test_ci_checks.py` | 上述三个校验器的单元自测（DD-13"单元层"骨架种子） | `python3 -m unittest discover -s scripts/ci/tests` |
+
+## commit-msg 规则与豁免白名单
+
+必过条件：`<type>(<scope>): <描述>`（type ∈ feat/fix/docs/refactor/test/ci/chore/perf/build，§8.3）
+＋ 正文含 `Task: IT-<数字>.<数字>`（允许尾注 `[Qn]`）＋ 标题与正文之间空一行。返回码非 0 即拒绝。
+
+豁免白名单（代码内注释同步列出理由）：
+
+1. **`Merge` / `Revert` 前缀**：平台/`git revert` 机器生成，非人工撰写；合入 squash（§8.3④）
+   后主线不保留 Merge 提交。
+2. **`fixup!` / `squash!` 前缀**：交互压缩中间态提交，压缩后的最终提交信息仍受本规则约束。
+3. **`Task: N/A: <理由>`**：仅限**初始 docs 基线**类提交（v2.2-baseline 文档先于任务卡体系产生，
+   无法回溯任务 ID）；必须同行或正文 `Reason:` 写明理由，否则拒绝。
+
+宽松项（告警不阻断）：scope 不在 §8.3 业务枚举内（计划暂未定义 infra 类 scope，见交付报告
+"发现与建议"）；缺 `Refs:`；标题超长；多条 `Task:`。
+
+## 快速自检（四连跑）
+
+```bash
+sh scripts/ci/install-hooks.sh                          # 装钩子（仅 git config）
+python3 -m unittest discover -s scripts/ci/tests        # 单元自测
+python3 scripts/ci/check_mermaid.py                     # mermaid 检查
+python3 scripts/ci/recalc_amount.py                     # 金额复算 + 文档比对
+```
+
+## 与流水线的关系
+
+`.github/workflows/ci.yaml`（GitHub Actions 语法）按序执行：commit-msg 范围校验 →
+mermaid 检查 → 金额复算 → 单元自测；契约 lint（IT-1.09）、评测集回归（IT-2.05）、
+DLP（IT-3.09）为声明的 TODO 槽位。**GitLab CI / Jenkins 用户**：将上述四步映射为
+四个 script 阶段即可，卡口语义（返回码非 0 阻断）不变；§8.2 `develop` 保护要求
+"CI 绿"即指本流水线。
+
+## 边界（本目录刻意不做的事）
+
+- mermaid 检查是**围栏/语法头/换行标记**级前置校验，非 headless 渲染（渲染级检查与
+  `mermaid-cli` 引入在 ci.yaml `TODO: 完整渲染` 槽位声明，待工具链预算确认）；
+- 金额复算只**验证**文档基线自洽，不引入任何业务计算依赖——金额权威方仍是促销服务
+  （DD-8.2），本工具属"示例数据治理（〇.1/L-2）"的文档侧复算义务；
+- 不触碰 `contracts/`、`eval/`（其他任务卡负责）。

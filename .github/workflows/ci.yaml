@@ -1,0 +1,65 @@
+# IT-1.11 · CI 基线流水线（工程骨架四步 + 后续任务槽位）
+#
+# 平台说明：本文件为 GitHub Actions 语法。若实际平台为 GitLab CI / Jenkins，
+# 请保持同名四步的等价阶段（返回码非 0 即阻断），并更新本注释（scripts/ci/README.md §与流水线的关系）。
+# 分支保护联动：《研发迭代计划.md》§8.2 —— develop 合入需 "1 Approve + CI 绿"，
+# 本流水线即该"CI 绿"的最小定义。
+name: ci
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop, main]
+
+jobs:
+  engineering-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # commit-msg 范围校验需要完整历史
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ── 步骤 1/4：commit-msg 校验（对范围提交，§8.3 硬约束①） ──────────────
+      - name: Gate 1 · commit message convention (range)
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ -n "$BASE_REF" ]; then
+            RANGE="origin/${BASE_REF}..HEAD"
+          elif [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            RANGE="${SHA}~1..${SHA}"   # 新分支首推：仅校验最新提交
+          else
+            RANGE="${BEFORE}..${SHA}"
+          fi
+          echo "校验提交范围: $RANGE"
+          python3 scripts/ci/check_commit_msg.py --range "$RANGE"
+
+      # ── 步骤 2/4：mermaid 围栏/语法头检查（附录 D，L-3） ────────────────────
+      - name: Gate 2 · mermaid fence & header check
+        run: python3 scripts/ci/check_mermaid.py --root .
+
+      # ── 步骤 3/4：DD-8.1 金额独立复算 + 设计文档基线比对 ────────────────────
+      - name: Gate 3 · amount recalculation (DD-8.1)
+        run: python3 scripts/ci/recalc_amount.py
+
+      # ── 步骤 4/4：单元自测（单测框架种子，DD-13 单元层） ────────────────────
+      - name: Gate 4 · unit self-tests (stdlib unittest)
+        run: python3 -m unittest discover -s scripts/ci/tests -v
+
+      # ══ 预留槽位（本卡只声明，不实现；触发任务见注释） ══════════════════════
+      # TODO: IT-1.09 —— 契约 lint：spectral/oadg lint contracts/*.yaml（含 SSE 事件帧、
+      #   错误码字典、金额分单位），起 mock server，前端/交易双消费者契约测试；
+      #   §8.4：contracts 变更需触发消费者契约重跑 + 兼容性声明。
+      # TODO: IT-2.05 —— 评测集回归：eval/golden-set-v1（≥200 条标注）Recall@5 ≥ 0.9 /
+      #   政策命中 ≥ 0.95 / 幻觉率门禁（DD-13 RAG 离线评测层，§8.3 卡口"评测集回归自 IT-2.05 起接入"）。
+      # TODO: IT-2.x —— 业务单测/契约测试并入本 Gate 4（目录约定 tests/ + discover，夹具来自 IT-1.07）。
+      # TODO: IT-3.09 —— DLP 扫描卡口（凭据/PII，§8.2 禁止项；gitleaks 类工具 + 自研 PII 规则）。
+      # TODO: 附录 D 完整渲染 —— mermaid-cli（@mermaid-js/mermaid-cli）headless 渲染
+      #   *.md 中全部图至 SVG 并断言零渲染错误；依赖 Node 工具链，待运维排期确认。

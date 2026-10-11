@@ -1,0 +1,138 @@
+openapi: 3.0.3
+info:
+  title: "TradeWise API v1 - 会话历史（Sessions）"
+  version: "1.0.0"
+  description: |
+    权威来源：《设计文档.md》DD-7.1 总览表（会话历史行：GET /api/v1/sessions/{id}/slots，Bearer+绑定，
+    非幂等标注"—"，非流式，RAG- 前缀，多端同步/重拉）、DD-3.3.1（槽位字段 1:1）、DD-3.2.3（version/turn_id）、
+    DD-9.1（session_state 字段骨架）、DD-6.1#16（会话过期 RAG-41001：引导新会话，草稿需重建，拒绝引用旧槽位）。
+
+    红线自查：金额不涉及；错误响应含 error_code/trace_id（R-5）；槽位命名 address_id/coupon_id 与 DD-3.3.1 1:1（H-2）。
+    兼容性（DD-7.1）：只增不改不删。示例值治理：全部示例为示例值，以实际服务返回为准（〇.1）。
+  x-contract-status: "IT-1.09 冻结预备（frozen-candidate）"
+  x-dd-mapping: "DD-7.1（会话历史行）/ DD-9.1 / DD-3.2.3 / DD-3.3.1 / DD-6.1#16"
+  license:
+    name: "Internal - TradeWise (契约文档随仓库维护，未对外授权)"
+
+servers:
+  - url: https://api.tradewise.example
+    description: "网关基址（示例值，以实际部署为准）"
+
+security:
+  - bearerAuth: []
+
+paths:
+  /api/v1/sessions/{session_id}/slots:
+    get:
+      operationId: getSessionSlots
+      summary: "会话槽位历史重拉（多端同步，DD-7.1）"
+      description: |
+        鉴权：Bearer + session 绑定校验（DD-5.2：session 与 token 主体绑定，不一致 401 +
+        SESSION_OWNER_MISMATCH 审计；该场景专属错误码未分配，见 errors-dict.yaml 文档冲突 C-④）。
+        用途：多端同步/重拉（DD-7.1）；客户端以 version 对账，冲突时后到写侧获得 RAG-40901 并重拉（DD-3.2.3）。
+        会话过期（TTL 30min，DD-12.3 驻留口径/ DD-9.1 last_active_at）→ RAG-41001（引导新会话，草稿需重建）。
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+          description: "不透明随机会话 ID（DD-5.1 T-SESS）。示例值，以实际服务返回为准。"
+        - $ref: "shared-schemas.yaml#/components/parameters/AuthorizationHeader"
+        - $ref: "shared-schemas.yaml#/components/parameters/XRequestIdHeader"
+        - $ref: "shared-schemas.yaml#/components/parameters/XTenantIdHeader"
+      responses:
+        "200":
+          description: "槽位快照重拉成功。"
+          content:
+            application/json:
+              schema:
+                type: object
+                allOf:
+                  - $ref: "shared-schemas.yaml#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        $ref: "#/components/schemas/SessionSlotsView"
+              example:
+                code: 0
+                trace_id: "trc_01HZXAMPLE0020"        # 示例值，以实际服务返回为准
+                data:
+                  session_id: "opaque_uuid_01HXAMPLE" # 示例值，以实际服务返回为准
+                  version: 12
+                  turn_id: 7
+                  slots:
+                    product: "Mac Studio"             # 示例值，以实际服务返回为准
+                    sku: "SKU_A"                      # 示例值，以实际服务返回为准
+                    quantity: 3
+                    address_id: "addr_001"            # 示例值，以实际服务返回为准
+                    coupon_id: "promo_batch_9"        # 示例值，以实际服务返回为准
+                    delivery_date: null
+                  missing_slots: []
+                  slot_meta:
+                    sku: { as_of: "2026-10-11T10:00:00Z", fact_version: "fv_示例" }
+                  pending_clarification: null
+                  degraded_flags: []
+                  last_active_at: "2026-10-11T10:12:00Z"
+        "401":
+          $ref: "shared-schemas.yaml#/components/responses/Err401"
+        "409":
+          description: "读侧 version 冲突 RAG-40901（重拉快照后重试，DD-3.2.3）。"
+          content:
+            application/json:
+              schema:
+                $ref: "shared-schemas.yaml#/components/schemas/ErrorEnvelope"
+        "410":
+          description: "RAG-41001 会话过期：引导新会话，草稿需重建（DD-6.1#16）。HTTP 410 与 DD-7.2 示例状态集差异见 errors-dict.yaml 文档冲突 C-①。"
+          content:
+            application/json:
+              schema:
+                $ref: "shared-schemas.yaml#/components/schemas/ErrorEnvelope"
+        "422":
+          $ref: "shared-schemas.yaml#/components/responses/Err422"
+        "429":
+          $ref: "shared-schemas.yaml#/components/responses/Err429"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: "与 shared-schemas.yaml components.securitySchemes 同构（本文件本地冗余声明，满足 OpenAPI 3.0 security 引用闭环）。"
+
+  schemas:
+    SessionSlotsView:
+      description: |
+        会话槽位视图（DD-9.1 session_state 关键字段的对外投影：version/turn_id/slots/slot_meta/
+        pending_clarification/degraded_flags/last_active_at）。
+        focus_stack（DD-3.2.4 指代候选栈）与 user_id/tenant_id 为服务端内部件，不对客户端暴露（最小暴露面）。
+      type: object
+      required: [session_id, version, turn_id, slots, missing_slots, last_active_at]
+      properties:
+        session_id:
+          type: string
+        version:
+          type: integer
+          description: "会话乐观锁版本号（DD-3.2.3/DD-9.1）；客户端写回需携带对应 version，冲突 RAG-40901。"
+        turn_id:
+          type: integer
+          description: "当前轮次水位（会话内单调，DD-7.6）。"
+        slots:
+          $ref: "shared-schemas.yaml#/components/schemas/Slot"
+        missing_slots:
+          type: array
+          description: "按当前意图必填矩阵（DD-3.3.2）尚缺的槽位名。"
+          items:
+            $ref: "shared-schemas.yaml#/components/schemas/SlotName"
+        slot_meta:
+          $ref: "shared-schemas.yaml#/components/schemas/SlotMeta"
+        pending_clarification:
+          type: object
+          nullable: true
+          description: "待确认澄清项（DD-9.1；确认/否定词绑定最近待确认动作，DD-3.2.4）。结构由对话服务透传，冻结版式待 M1 联调（文档缺口 G-④）。"
+        degraded_flags:
+          type: array
+          items: { type: string }
+          description: "降级标记集（DD-9.1；价格类降级回复必携 price_as_of，DD-6.3②）。示例值，以实际服务返回为准。"
+        last_active_at:
+          $ref: "shared-schemas.yaml#/components/schemas/DateTimeUTC"

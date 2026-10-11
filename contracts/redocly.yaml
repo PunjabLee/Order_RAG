@@ -1,0 +1,8 @@
+# lint 规则口径（IT-1.09；CI 接入归 IT-1.11）
+extends: [recommended]
+rules:
+  # 跨文件 $ref 与 x-sse-events 扩展引用不被静态计数，共享件必然"未使用"
+  no-unused-components: off
+  # /orders/drafts/{id} 与 /orders/{id}/cancel 的路径集合由 DD-7.1 总览表定义，契约层不可调整
+  no-ambiguous-paths: off
+  info-license: warn

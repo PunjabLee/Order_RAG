@@ -18,7 +18,8 @@ from src.nlu.config import load_config
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__),
                                          "..", "..", ".."))
 NLU_DIR = os.path.join(REPO_ROOT, "src", "nlu")
-NLU_MODULES = ("intents.py", "normalize.py", "config.py", "__init__.py")
+NLU_MODULES = ("intents.py", "router.py", "normalize.py", "config.py",
+               "schema.py", "providers.py", "__init__.py")
 
 EXPECTED_SEVEN = {
     "PRICE_QUERY", "PROMO_QUERY", "DELIVERY_QUERY", "ORDER_CREATE",

@@ -1,0 +1,600 @@
+# -*- coding: utf-8 -*-
+"""查询理解分层路由（DD-3.1 整改 M-2：信号→动作决策表 + 阈值收口）。
+
+分层策略（阈值全部走配置，禁硬编码；nlu.conf_low 默认 0.6）：
+1. 规则/词表命中（词表置信 ≥conf_rule_strong=0.9）→ 直接路由（目标 ≤50ms）；
+2. 小模型（provider 可注入；≥conf_low 采纳）→ 路由；
+3. 低于 conf_low 或多轮复杂 → LLM 结构化输出（JSON Schema 约束、intent 枚举
+   受限、additionalProperties:false）；解析失败重试 llm_retry_max 次 →
+   降级小模型结果 → 模板澄清；失败计入 nlu.parse_fail 指标回调（DD-11.2）。
+
+信号→处置决策表（8 行）逐行落地于 _detect_signals/_finalize：
+  1 指代/序数      → 标注 coref，消解算法属 IT-2.03（DD-3.2.4）；置信<conf_low 再澄清
+  2 省略句         → 从槽位快照补全；补不出则澄清
+  3 多意图         → action=FANOUT（DD-3.5.3 DAG 并行扇出，IT-2.08 执行）
+  4 实体歧义 1→N   → action=CLARIFY + options[]（点选，DD-7.3）
+  5 槽位缺失       → 必填矩阵（DD-3.3.2）比对 → 定向澄清
+  6 领域外         → intent=OUT_OF_SCOPE 或全部置信<conf_oos → 引导话术，禁止 API（US-007-S4）
+  7 低置信 0.4–0.6 → 升级 LLM；仍低 → 澄清
+  8 极短输入 ≤3字  → 含焦点实体则继承，否则澄清
+
+**零网络**：本模块只产出路由决策对象；API 调用由 IT-2.08 调用器执行，
+决策经 on_api_call sink 记录（OUT_OF_SCOPE/澄清/引导恒不触发，测试以 call-spy 断言）。
+"""
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, field
+
+from src.nlu import intents as cat
+from src.nlu.config import Config, ConfigError, load_config
+from src.nlu.normalize import (
+    QuantityResult,
+    extract_quantity,
+    match_model_alias,
+    normalize_text,
+    sku_candidates,
+)
+from src.nlu.schema import build_nlu_schema, validate_nlu_output
+
+
+class Action:
+    """处置动作（DD-3.1 决策表'处置动作'列的可测枚举）。"""
+    ROUTE = "route"                 # 只读路由目标（IT-2.08 执行）
+    FANOUT = "fanout"               # 多意图 DAG 并行扇出（DD-3.5.3）
+    CLARIFY = "clarify"             # 澄清追问（模板或点选 options）
+    GUIDE = "guide"                 # 领域外引导话术，禁止 API（US-007-S4）
+    TRANSFER = "transfer"           # 转人工（US-009）
+
+
+class Layer:
+    RULE = "rule"
+    SMALL = "small"
+    LLM = "llm"
+    FALLBACK = "fallback"           # 降级链末端（模板澄清）
+
+
+class Signal:
+    COREF = "coref"
+    ELLIPSIS = "ellipsis"
+    MULTI_INTENT = "multi_intent"
+    SKU_AMBIGUOUS = "sku_ambiguous"
+    SLOT_MISSING = "slot_missing"
+    OUT_OF_SCOPE = "out_of_scope"
+    LOW_CONFIDENCE = "low_confidence"
+    SHORT_INPUT = "short_input"
+    QUANTITY_AMBIGUOUS = "quantity_ambiguous"
+
+
+@dataclass(frozen=True)
+class ScoreLabel:
+    intent: str
+    confidence: float
+    weight: float = 0.0             # 规则层证据强度（scoring.rule_weight_* 累计）
+    matched: tuple = ()
+
+    @property
+    def is_readonly_route(self) -> bool:
+        return self.intent in cat.INTENTS and self.intent not in (
+            cat.OUT_OF_SCOPE, cat.ESCALATE_HUMAN)
+
+
+@dataclass
+class Decision:
+    """路由决策对象（可 JSON 序列化进 trace，DD-11.1）。"""
+    query: str
+    normalized: str = ""
+    intent: str | None = None
+    confidence: float = 0.0
+    layer: str = Layer.FALLBACK
+    action: str = Action.CLARIFY
+    api_calls: list = field(default_factory=list)   # 只读路由目标声明（OUT_OF_SCOPE 恒空）
+    multi_intents: list = field(default_factory=list)
+    missing_slots: list = field(default_factory=list)
+    slots: dict = field(default_factory=dict)
+    options: list = field(default_factory=list)      # 实体歧义点选（决策表行 4）
+    signals: list = field(default_factory=list)
+    template: str | None = None                      # 澄清/引导话术（模板直出基线）
+    llm_attempts: int = 0
+    parse_fail_events: int = 0
+    notes: str = ""
+
+    def to_dict(self) -> dict:
+        return dict(self.__dict__)
+
+    # ---- 便捷判定（测试/回调断言用） ----
+    @property
+    def is_out_of_scope(self) -> bool:
+        return self.intent == cat.OUT_OF_SCOPE or self.action == Action.GUIDE
+
+    @property
+    def involves_api(self) -> bool:
+        return self.action in (Action.ROUTE, Action.FANOUT) and bool(self.api_calls)
+
+
+class RuleLayer:
+    """词表/正则规则层：DD-3.1 分层策略第一层（词表置信 ≥0.9 直接路由）。"""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.priority = cfg.priority()
+        # 证据权重来自配置标尺（scoring.*），非硬编码
+        self.w_strong = cfg.rule_weight_strong
+        self.w_weak = cfg.rule_weight_weak
+        self._compiled = {}
+        for intent in cat.INTENTS:
+            v = cfg.vocab(intent)
+            self._compiled[intent] = {
+                "strong": list(v["strong"]),
+                "weak": list(v["weak"]),
+                "regex_strong": [re.compile(r) for r in v["regex_strong"]],
+                "regex_weak": [re.compile(r) for r in v["regex_weak"]],
+            }
+
+    def classify(self, query: str) -> list:
+        """返回按 (weight desc, priority asc) 排序的标签；无命中 → []。"""
+        text = normalize_text(query)
+        labels = []
+        for intent, packs in self._compiled.items():
+            matched, weight, has_strong = [], 0.0, False
+            for term in packs["strong"]:
+                if term and term in text:
+                    matched.append(term)
+                    weight += self.w_strong
+                    has_strong = True
+            for term in packs["weak"]:
+                if term and term in text:
+                    matched.append(term)
+                    weight += self.w_weak
+            for rx in packs["regex_strong"]:
+                m = rx.search(text)
+                if m:
+                    matched.append(m.group(0))
+                    weight += self.w_strong
+                    has_strong = True
+            for rx in packs["regex_weak"]:
+                m = rx.search(text)
+                if m:
+                    matched.append(m.group(0))
+                    weight += self.w_weak
+            if weight > 0:
+                conf = (self.cfg.conf_rule_strong if has_strong
+                        else self.cfg.conf_rule_weak)
+                labels.append(ScoreLabel(intent, conf, weight, tuple(matched)))
+        labels.sort(key=lambda l: (-l.weight, self._prio(l.intent)))
+        return labels
+
+    def _prio(self, intent: str) -> int:
+        return self.priority.index(intent)
+
+
+class Pipeline:
+    """规则 → 小模型 → LLM 兜底的分层查询理解管线（provider 可注入，零网络）。"""
+
+    def __init__(self, cfg: Config | None = None, small_model=None, llm=None,
+                 on_parse_fail=None, on_api_call=None):
+        self.cfg = cfg or load_config()
+        self.rule = RuleLayer(self.cfg)
+        self.small_model = small_model
+        self.llm = llm
+        # 指标回调：nlu.parse_fail（DD-11.2）；默认无操作
+        self._on_parse_fail = on_parse_fail or (lambda event: None)
+        # API 调用 sink：真实调用属 IT-2.08；本管线只声明+记账（call-spy 测试 US-007-S4）
+        self._on_api_call = on_api_call
+
+    # ------------------------------------------------------------------
+    def understand(self, query: str, context: dict | None = None) -> Decision:
+        cfg = self.cfg
+        ctx = context or {}
+        norm = normalize_text(query)
+        dec = Decision(query=query, normalized=norm)
+
+        # ---- 0. 归一化 + 信号检测（决策表行 1/2/4/8 的信号位） ----
+        qty = extract_quantity(query, cfg)
+        alias_matches = match_model_alias(query, cfg)
+        cands = sku_candidates(alias_matches)
+        signals = self._detect_signals(norm, ctx, qty, cands)
+        dec.signals = signals
+        # ---- 1. 规则/词表层（≥conf_rule_strong 直接路由） ----
+        rule_labels = self.rule.classify(norm)
+        best = rule_labels[0] if rule_labels else None
+        rule_strong_hit = best is not None and best.confidence >= cfg.conf_rule_strong
+
+        # 决策表行 6/转接：领域外与转人工词表强/弱命中即短路
+        # （US-007-S4：OUT_OF_SCOPE 处置＝引导话术，api_calls 恒空；
+        #   "多少钱"类通用弱词不足以压制显式领域外信号，故这两类 ≥conf_rule_weak 即处置）
+        if best is not None and best.confidence >= cfg.conf_rule_weak:
+            if best.intent == cat.OUT_OF_SCOPE:
+                return self._issue(self._oos_decision(dec, signals,
+                                                      "词表命中领域外（DD-3.1 行 6，禁止 API 调用）"))
+            if best.intent == cat.ESCALATE_HUMAN:
+                dec.intent = cat.ESCALATE_HUMAN
+                dec.confidence = best.confidence
+                dec.layer = Layer.RULE
+                dec.action = Action.TRANSFER
+                dec.api_calls = []
+                dec.template = cfg.template("escalate_ack")
+                return self._issue(dec)
+
+        slots = self._collect_slots(ctx, qty, cands, norm)
+        dec.slots = slots
+
+        # 决策表行 1/2/8：指代·省略·极短输入（无规则强命中时）→ 上下文继承或澄清。
+        # 消解算法本体属 IT-2.03（DD-3.2.4）；本轮按"栈顶焦点实体 + 上一轮意图"
+        # 做最小可测继承，消解证据不足时置信按 conf_coref_min 下限处置。
+        follow_up = (Signal.SHORT_INPUT in signals or Signal.COREF in signals
+                     or Signal.ELLIPSIS in signals)
+        # 触发条件：指代/省略/极短 **且** 规则层意图证据不足（无命中或 <conf_low）；
+        # 规则层已有 ≥conf_low 的命中时按分层策略优先路由（行 1 的消解只补意图缺口）。
+        if follow_up and (best is None or best.confidence < cfg.conf_low):
+            inherited = self._inherit_context(dec, slots, ctx, qty, cands, signals)
+            if inherited is not None:
+                return inherited
+            if Signal.SHORT_INPUT in signals:
+                dec.action = Action.CLARIFY
+                dec.template = cfg.template("clarify_short_input")
+                dec.notes = "极短输入且无继承证据 → 澄清（DD-3.1 行 8）"
+                return self._issue(dec)
+            # 有指代/省略信号但无法确定继承意图 → 定向澄清（**不得**按领域外处置：
+            #   领域外需显式证据（词表命中或分类器置信分布），省略句本身是域内信号）
+            dec.action = Action.CLARIFY
+            dec.layer = Layer.FALLBACK
+            dec.template = cfg.template("clarify_generic")
+            dec.notes = "指代/省略且上下文无可继承证据 → 澄清（DD-3.1 行 1/2）"
+            return self._issue(dec)
+
+        # 决策表行 4（模糊别名 1→N sku → 点选澄清）统一在 _finalize 处置，
+        # 位于意图判定之后——LLM/小模型仍有机会给出意图，再行 options 澄清。
+        multi = self._rule_multi_intent(rule_labels)
+        if multi:
+            signals.append(Signal.MULTI_INTENT)
+            dec.signals = signals
+            return self._issue(self._fanout_decision(dec, multi, slots))
+        if best is not None and best.confidence >= cfg.conf_rule_strong:
+            dec.intent = best.intent
+            dec.confidence = best.confidence
+            dec.layer = Layer.RULE
+            dec.multi_intents = [l.intent for l in rule_labels if l.weight > 0]
+            return self._finalize(dec, slots, ctx, qty, cands, signals)
+
+        # ---- 2. 小模型层（provider 可注入；≥conf_low 采纳） ----
+        small_labels = self._run_small_model(norm, query)
+        small_best = small_labels[0] if small_labels else None
+        complex_multi_turn = self._is_complex_multi_turn(ctx)
+
+        if (best is None or best.confidence < cfg.conf_low) and not complex_multi_turn:
+            if small_best is not None and small_best.confidence >= cfg.conf_low:
+                dec.intent = small_best.intent
+                dec.confidence = small_best.confidence
+                dec.layer = Layer.SMALL
+                return self._finalize(dec, slots, ctx, qty, cands, signals)
+            # 决策表行 6：全部置信 < conf_oos → 领域外处置（禁止 API）
+            if small_best is not None and small_best.confidence < cfg.conf_oos:
+                return self._issue(self._oos_decision(dec, signals,
+                                                      "小模型全部置信低于 conf_oos（DD-3.1 行 6）"))
+
+        # ---- 3. LLM 兜底（低置信 0.4–0.6 或多轮复杂；决策表行 7） ----
+        # 注：规则层与小模型**均无输出**且未注入 LLM 时 → 澄清而非领域外
+        #（行 6 的领域外判定需显式证据：领域外词表命中，或分类器全部置信 <conf_oos）。
+        if best is not None and best.confidence >= cfg.conf_low and not complex_multi_turn:
+            # 规则弱命中（conf_low ≤ c < conf_rule_strong）→ 规则层直接路由
+            dec.intent = best.intent
+            dec.confidence = best.confidence
+            dec.layer = Layer.RULE
+            return self._finalize(dec, slots, ctx, qty, cands, signals)
+
+        signals.append(Signal.LOW_CONFIDENCE)
+        dec.signals = signals
+        if self.llm is None and best is None and small_best is None:
+            dec.action = Action.CLARIFY
+            dec.layer = Layer.FALLBACK
+            dec.template = cfg.template("clarify_generic")
+            dec.notes = "各层均无证据且 LLM 未接入 → 澄清（行 7 降级链末端）"
+            return self._issue(dec)
+        llm_payload, llm_errors, attempts, fails = self._run_llm(norm, dec, small_best)
+        dec.llm_attempts = attempts
+        dec.parse_fail_events = fails
+        if llm_payload is None:
+            # 降级链：小模型结果 → 模板澄清（DD-3.1）
+            if small_best is not None and small_best.confidence >= cfg.conf_low:
+                dec.intent = small_best.intent
+                dec.confidence = small_best.confidence
+                dec.layer = Layer.SMALL
+                dec.notes = "LLM 解析失败（含重试）→ 降级小模型结果"
+                return self._finalize(dec, slots, ctx, qty, cands, signals,
+                                     ignore_llm_errors=True)
+            dec.action = Action.CLARIFY
+            dec.layer = Layer.FALLBACK
+            dec.template = cfg.template("clarify_llm_fail")
+            dec.notes = "LLM 解析失败 → 降级小模型无果 → 模板澄清；parse_fail 已计" + str(fails)
+            return self._issue(dec)
+
+        intent = llm_payload["intent"]
+        conf = float(llm_payload["confidence"])
+        dec.intent = intent
+        dec.confidence = conf
+        dec.layer = Layer.LLM
+        if intent == cat.OUT_OF_SCOPE or conf < cfg.conf_oos:
+            return self._issue(self._oos_decision(dec, signals,
+                                                  "LLM 判定领域外或置信<conf_oos（行 6/7）"))
+        if intent == cat.ESCALATE_HUMAN:
+            dec.action = Action.TRANSFER
+            dec.api_calls = []
+            dec.template = cfg.template("escalate_ack")
+            return self._issue(dec)
+        llm_slots = dict(slots)
+        for k, v in (llm_payload.get("entities") or {}).items():
+            if v is not None:
+                llm_slots[k] = v
+        return self._finalize(dec, llm_slots, ctx, qty, cands, signals)
+
+    def _inherit_context(self, dec: Decision, slots: dict, ctx: dict,
+                         qty: QuantityResult, cands: list, signals: list):
+        """决策表行 1/2/8 的继承处置：上一轮意图 + 焦点实体/槽位快照。
+
+        返回 Decision 表示已处置；None 表示无继承证据（由调用方澄清）。
+        置信取配置 conf_coref_min（消解下限，默认＝conf_low＝0.6）：
+        证据＝焦点实体单值 **或** 会话快照已有槽位；两者皆无 → 不继承（禁猜测）。
+        """
+        cfg = self.cfg
+        last_intent = ctx.get("last_intent")
+        if last_intent not in cat.INTENT_SET:
+            return None
+        focus = ctx.get("focus_entity") or {}
+        refs = focus.get("ref") if isinstance(focus, dict) else None
+        # 栈顶存在候选即可继承**意图**；实体仅当单值时才写入槽位（多候选不猜测，
+        # 交由 _finalize 的必填矩阵/实体歧义澄清 —— DD-3.1 行 1"置信<conf_low 再澄清"）
+        has_focus = isinstance(refs, list) and len(refs) >= 1
+        has_snapshot = bool(ctx.get("slots"))
+        if not (has_focus or has_snapshot):
+            return None
+        if len(cands) > 1:
+            # 本轮自身仍有实体歧义 → 交由 _finalize 点选（行 4 优先于继承）
+            pass
+        dec.intent = last_intent
+        dec.confidence = cfg.conf_coref_min
+        dec.layer = Layer.RULE
+        dec.notes = ("上下文继承：意图＝last_intent、实体＝焦点实体/槽位快照"
+                     "（DD-3.1 行 1/2/8；消解算法本体属 IT-2.03）")
+        return self._finalize(dec, slots, ctx, qty, cands, signals)
+
+    # ------------------------------------------------------------------
+    # 信号检测（决策表 8 行的检测方式列）
+    def _detect_signals(self, norm: str, ctx: dict, qty: QuantityResult,
+                        cands: list) -> list:
+        cfg = self.cfg
+        signals = []
+        for pat in cfg.signals("coref"):
+            if re.search(pat, norm):
+                signals.append(Signal.COREF)
+                break
+        for pat in cfg.signals("ellipsis"):
+            if pat in norm:
+                signals.append(Signal.ELLIPSIS)
+                break
+        if len(norm.replace(" ", "")) <= cfg.short_input_max_chars:
+            signals.append(Signal.SHORT_INPUT)
+        if qty.ambiguous:
+            signals.append(Signal.QUANTITY_AMBIGUOUS)
+        if len(cands) > 1:
+            signals.append(Signal.SKU_AMBIGUOUS)
+        return signals
+
+    def _collect_slots(self, ctx: dict, qty: QuantityResult, cands: list,
+                       norm: str = "") -> dict:
+        """槽位快照（DD-3.2 会话服务读侧）+ 归一化结果合并；只读、不校验（校验属 IT-2.04）。"""
+        slots = {}
+        for name in cat.ALL_SLOTS + ("order_id",):
+            v = (ctx.get("slots") or {}).get(name)
+            if v is not None:
+                slots[name] = v
+        if qty.value is not None and "quantity" not in slots:
+            slots["quantity"] = qty.value
+        if len(cands) == 1 and "sku" not in slots:
+            slots["sku"] = cands[0]
+        # 焦点实体继承（DD-3.1 行 8 / DD-3.2.1 focus_entity；消解算法本体属 IT-2.03，
+        # 此处仅做栈顶单值继承；多候选不继承、交由实体歧义澄清）
+        focus = ctx.get("focus_entity") or {}
+        refs = focus.get("ref") if isinstance(focus, dict) else None
+        if isinstance(refs, list) and len(refs) == 1:
+            if "sku" not in slots and str(refs[0]).upper().startswith("SKU"):
+                slots["sku"] = refs[0]
+            if "product" not in slots:
+                slots["product"] = refs[0]
+        # product：商品词表（配置 slot_hints.product_terms）或型号别名命中（别名＝商品名级）
+        if "product" not in slots:
+            for term in self.cfg.get("slot_hints.product_terms"):
+                if term and term in norm:
+                    slots["product"] = term
+                    break
+            else:
+                if cands:
+                    slots["product"] = cands[0]  # 由 sku 粒度推定（DD-3.3.2 product ○ 注释）
+        return slots
+
+    def _rule_multi_intent(self, labels: list) -> list:
+        """决策表行 3 的规则侧信号：恰好两个只读意图以同一最高权重强命中
+        （US-007-S2『多少钱，什么时候到』）；≥3 视为歧义取 top（交由澄清/消解）。"""
+        if len(labels) < 2:
+            return []
+        top_w = labels[0].weight
+        tied = [l for l in labels if abs(l.weight - top_w) < 1e-9
+                and l.confidence >= self.cfg.conf_rule_strong]
+        ro = [l for l in tied if l.is_readonly_route]
+        if len(ro) == 2:
+            return ro
+        return []
+
+    def _fanout_decision(self, dec: Decision, labels: list, slots: dict) -> Decision:
+        """多意图 → DAG 并行扇出声明（DD-3.5.3，执行属 IT-2.08；预算 +200ms）。"""
+        dec.action = Action.FANOUT
+        dec.layer = Layer.RULE
+        dec.multi_intents = [l.intent for l in labels]
+        dec.intent = labels[0].intent  # top（权重同则按目录优先级）
+        dec.confidence = labels[0].confidence
+        targets = []
+        for l in labels:
+            for t in cat.route_targets(l.intent):
+                if t not in targets:
+                    targets.append(t)
+        dec.api_calls = targets
+        dec.notes = "多意图 DAG 并行扇出（DD-3.1 行 3 / DD-3.5.3）"
+        return dec
+
+    def _oos_decision(self, dec: Decision, signals: list, note: str) -> Decision:
+        """行 6：领域外＝引导话术，禁止 API 调用（US-007-S4：api_calls 恒空）。"""
+        if Signal.OUT_OF_SCOPE not in signals:
+            signals = signals + [Signal.OUT_OF_SCOPE]
+        dec.signals = signals
+        dec.intent = cat.OUT_OF_SCOPE
+        dec.action = Action.GUIDE
+        dec.api_calls = []            # 硬约束：零 API
+        dec.layer = dec.layer if dec.layer != Layer.FALLBACK else Layer.RULE
+        dec.template = self.cfg.template("out_of_scope_guide")
+        dec.notes = note
+        return dec
+
+    # ------------------------------------------------------------------
+    def _run_small_model(self, norm: str, query: str) -> list:
+        if self.small_model is None:
+            return []
+        scores = self.small_model.classify(query, norm) or {}
+        labels = [ScoreLabel(intent=i, confidence=float(c))
+                  for i, c in scores.items() if i in cat.INTENT_SET]
+        labels.sort(key=lambda l: (-l.confidence, self.rule._prio(l.intent)))
+        return labels
+
+    def _is_complex_multi_turn(self, ctx: dict) -> bool:
+        """『多轮复杂』信号：显式标记或轮数 ≥ complex_turn_threshold（配置化）。"""
+        if ctx.get("multi_turn_complex"):
+            return True
+        return int(ctx.get("turn_count") or 0) >= self.cfg.complex_turn_threshold
+
+    def _run_llm(self, norm: str, dec: Decision, small_best):
+        """LLM 结构化输出：JSON 解析 + Schema 校验；失败重试 llm_retry_max → None。
+
+        每次解析/校验失败即时计入 nlu.parse_fail 回调（DD-11.2）。
+        """
+        cfg = self.cfg
+        schema = build_nlu_schema()
+        attempts = 0
+        fails = 0
+        errors: list = []
+        payload = None
+        while attempts <= cfg.llm_retry_max:
+            attempts += 1
+            raw = None
+            if self.llm is not None:
+                try:
+                    raw = self.llm.generate(dec.query, schema, attempts)
+                except Exception as exc:  # provider 异常视作解析失败进入降级链
+                    errors = [f"provider_error: {exc}"]
+            else:
+                errors = ["未注入 LLM provider（本轮基线为可插拔接口）"]
+            if raw is not None:
+                try:
+                    parsed = json.loads(raw) if isinstance(raw, str) else raw
+                except (json.JSONDecodeError, TypeError) as exc:
+                    errors = [f"json_parse: {exc}"]
+                    parsed = None
+                if parsed is not None:
+                    errs = validate_nlu_output(parsed, schema)
+                    if not errs and parsed.get("intent") in cat.INTENT_SET:
+                        payload = parsed
+                        break
+                    errors = errs or ["intent 不在七枚举"]
+            # 本次尝试失败 → 计指标 + 重试
+            fails += 1
+            self._on_parse_fail({
+                "metric": "nlu.parse_fail",
+                "query": dec.query,
+                "attempt": attempts,
+                "errors": list(errors),
+            })
+            if attempts > cfg.llm_retry_max:
+                break
+        dec.notes_llm_errors = errors  # 调试用（不进 trace 契约）
+        return payload, errors, attempts, fails
+
+    # ------------------------------------------------------------------
+    def _finalize(self, dec: Decision, slots: dict, ctx: dict,
+                  qty: QuantityResult, cands: list, signals: list,
+                  ignore_llm_errors: bool = False) -> Decision:
+        """路由前槽位处置：行 2（快照补全）/行 4（歧义点选）/行 5（必填矩阵澄清）。"""
+        cfg = self.cfg
+        intent = dec.intent
+        if intent in (cat.OUT_OF_SCOPE,):
+            return self._issue(self._oos_decision(dec, signals, "intent=OUT_OF_SCOPE（行 6）"))
+        if intent == cat.ESCALATE_HUMAN:
+            dec.action = Action.TRANSFER
+            dec.api_calls = []
+            dec.template = cfg.template("escalate_ack")
+            dec.signals = self._uniq(signals)
+            return self._issue(dec)
+
+        dec.slots = {k: v for k, v in slots.items() if v is not None}
+
+        # 行 4：实体歧义（1→N sku）→ clarification + options[]
+        if len(cands) > 1 and "sku" not in dec.slots:
+            dec.action = Action.CLARIFY
+            dec.options = list(cands)
+            dec.missing_slots = ["sku"]
+            dec.template = cfg.template("clarify_sku_ambiguous").format(
+                options="、".join(cands))
+            dec.signals = self._uniq(signals + [Signal.SKU_AMBIGUOUS])
+            return self._issue(dec)
+
+        # 行 1：省略句 → 快照补全（_collect_slots 已做），仍缺必填 → 澄清
+        required = cat.required_slots(intent)
+        missing = sorted(s for s in required if dec.slots.get(s) in (None, ""))
+        # 数量模糊（"一批"→触发数量澄清，DD-3.1 归一化行）：任何意图携带 quantity 皆澄清
+        if qty.ambiguous and "quantity" not in missing and dec.slots.get("quantity") is None:
+            missing.append("quantity")
+        if missing:
+            dec.action = Action.CLARIFY
+            dec.missing_slots = missing
+            dec.signals = self._uniq(signals + [Signal.SLOT_MISSING])
+            dec.template = self._slot_template(intent, missing, qty)
+            return self._issue(dec)
+
+        # 行 7 尾部：LLM/小模型仍低置信（≥conf_oos 但 <conf_low 且链路已到顶）→ 澄清
+        if dec.layer in (Layer.LLM, Layer.SMALL) and dec.confidence < cfg.conf_low \
+                and not ignore_llm_errors:
+            dec.action = Action.CLARIFY
+            dec.signals = self._uniq(signals + [Signal.LOW_CONFIDENCE])
+            dec.template = cfg.template("clarify_generic")
+            dec.notes = (dec.notes + "；仍低置信 → 澄清（行 7）").strip("；")
+            return self._issue(dec)
+
+        # 通过：只读路由声明
+        dec.action = Action.ROUTE
+        dec.api_calls = list(cat.route_targets(intent))
+        dec.signals = self._uniq(signals)
+        return self._issue(dec)
+
+    def _slot_template(self, intent: str, missing: list, qty: QuantityResult | None = None) -> str:
+        cfg = self.cfg
+        parts = []
+        for slot in missing:
+            if slot == "quantity" and qty is not None and qty.ambiguous:
+                # 模糊量词（"一批"）→ 专用数量澄清话术（DD-3.1 归一化行）
+                parts.append(cfg.template("clarify_quantity_ambiguous").format(
+                    phrase="、".join(qty.ambiguous_phrases) or "您说的数量"))
+                continue
+            t = cfg.slot_clarify(intent, slot)
+            if not t:
+                t = cfg.template("clarify_generic")
+            parts.append(t)
+        return " ".join(dict.fromkeys(parts))  # 去重保序
+
+    def _issue(self, dec: Decision) -> Decision:
+        """经 sink 记录路由声明（真实调用属 IT-2.08）；GUIDE/CLARIFY/TRANSFER 恒不记录。"""
+        if self._on_api_call is not None:
+            for target in dec.api_calls:
+                self._on_api_call(target)
+        return dec
+
+    @staticmethod
+    def _uniq(seq: list) -> list:
+        return list(dict.fromkeys(seq))

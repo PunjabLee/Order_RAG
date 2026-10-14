@@ -32,6 +32,15 @@ from src.nlu.normalize import (  # noqa: F401
     extract_quantity,
     match_model_alias,
 )
+from src.nlu.router import (  # noqa: F401
+    Action,
+    Decision,
+    Layer,
+    Pipeline,
+    RuleLayer,
+    ScoreLabel,
+    Signal,
+)
 
 __all__ = [
     "INTENTS", "PRICE_QUERY", "PROMO_QUERY", "DELIVERY_QUERY", "ORDER_CREATE",
@@ -40,4 +49,5 @@ __all__ = [
     "Config", "ConfigError", "load_config",
     "normalize_text", "parse_chinese_number", "extract_quantity",
     "match_model_alias",
+    "Action", "Decision", "Layer", "Pipeline", "RuleLayer", "ScoreLabel", "Signal",
 ]

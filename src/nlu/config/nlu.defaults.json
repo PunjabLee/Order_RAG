@@ -1,0 +1,423 @@
+{
+  "_meta": {
+    "module": "src/nlu",
+    "task": "IT-2.02",
+    "authority": "设计文档 DD-3.1（意图目录/决策表/分层阈值/中文归一化）与 DD-3.3.2（槽位矩阵引用）",
+    "format_note": "任务卡允许在 yaml/json 间自行取舍：Python 标准库无 yaml 解析器且禁止第三方运行时依赖，故采用 JSON（交付报告已说明）。",
+    "assumptions": "阈值 conf_rule_weak/conf_coref_min/complex_turn_threshold 为工程假设值（G-B 待校准，禁硬编码改此文件+env 覆盖）；model_alias 真实别名随 Q1/商品服务联调回填（附录 F Q7），当前 entries 为 eval/fixtures/promotion.json SKU_A~D 的 model_alias 占位。金额类数值一律不得出现在本配置（DD-16 R-07）。"
+  },
+  "thresholds": {
+    "conf_rule_strong": 0.9,
+    "_conf_rule_strong_note": "DD-3.1 分层策略：词表命中置信 ≥0.9 → 直接路由（规则层目标 ≤50ms）",
+    "conf_rule_weak": 0.75,
+    "_conf_rule_weak_note": "仅弱词表命中（通用词）时的规则层置信，为假设值（G-B 校准，Q：阈值标定属 IT-2.02 实测）；仍 ≥conf_low → 直接路由",
+    "conf_low": 0.6,
+    "_conf_low_note": "nlu.conf_low（DD-3.1 显式配置项，默认 0.6）：低于此值或多轮复杂 → 升级 LLM 结构化输出",
+    "conf_oos": 0.4,
+    "_conf_oos_note": "DD-3.1 决策表行 6：全部置信 <0.4 → 领域外处置（引导话术，禁止 API 调用，US-007-S4）",
+    "conf_coref_min": 0.6,
+    "_conf_coref_min_note": "指代消解置信下限（DD-3.1 行 1『置信<0.6 再澄清』；消解算法本体属 IT-2.03）",
+    "short_input_max_chars": 3,
+    "_short_input_note": "极短输入 ≤3 字（DD-3.1 行 8）：含焦点实体则继承，否则澄清",
+    "llm_retry_max": 1,
+    "_llm_retry_note": "LLM 结构化输出解析失败重试 1 次（DD-3.1 降级链）",
+    "complex_turn_threshold": 3,
+    "_complex_turn_note": "『多轮复杂』升级 LLM 的轮数阈值（DD-3.1 分层策略），假设值待 G-B 校准"
+  },
+  "scoring": {
+    "_note": "分层打分的内部标尺（工程假设值，G-B 校准项，Q：阈值标定属 IT-2.02 实测/后续模型评测）。非业务置信阈值——业务阈值一律走 thresholds（nlu.conf_low 等）。",
+    "rule_weight_strong": 1.0,
+    "_rule_weight_strong_note": "专有触发词命中权重（strong 命中即置信 conf_rule_strong）",
+    "rule_weight_weak": 0.5,
+    "_rule_weight_weak_note": "通用弱词权重（仅弱命中时置信 conf_rule_weak，仍 ≥conf_low 直路由）",
+    "small_model_base": 0.45,
+    "small_model_step": 0.05,
+    "small_model_cap": 0.7,
+    "_small_model_note": "启发式基线（HeuristicBigramSmallModel）打分带假设值：cap < conf_rule_strong，永不冒充规则层高置信"
+  },
+  "rule_vocab": {
+    "_note": "DD-3.1 意图目录『触发词示例』的可配置扩展；strong=专有触发词（命中即 conf_rule_strong），weak=通用词（0 个专有命中时 conf_rule_weak）。多意图＝≥2 个只读意图同时强命中（决策表行 3 → DD-3.5.3 DAG 扇出，IT-2.08 执行）。",
+    "priority": [
+      "ESCALATE_HUMAN",
+      "OUT_OF_SCOPE",
+      "ORDER_QUERY",
+      "DELIVERY_QUERY",
+      "ORDER_CREATE",
+      "PROMO_QUERY",
+      "PRICE_QUERY"
+    ],
+    "PRICE_QUERY": {
+      "strong": [
+        "价格",
+        "多少钱",
+        "什么价",
+        "多少米",
+        "报价",
+        "单价",
+        "总价",
+        "到手价",
+        "差价",
+        "贵多少",
+        "银子",
+        "成本价",
+        "现在价"
+      ],
+      "weak": [
+        "什么配置"
+      ],
+      "regex_strong": [],
+      "regex_weak": []
+    },
+    "PROMO_QUERY": {
+      "strong": [
+        "优惠",
+        "便宜",
+        "折扣",
+        "打折",
+        "满减",
+        "抵扣",
+        "券",
+        "新客",
+        "教育",
+        "学生价",
+        "叠加",
+        "划算",
+        "试算",
+        "促销",
+        "返点",
+        "协议价",
+        "内部价",
+        "底价",
+        "凑",
+        "膨胀",
+        "赠",
+        "活动",
+        "批量",
+        "门槛",
+        "最省",
+        "用上",
+        "双11",
+        "双十一",
+        "能减"
+      ],
+      "weak": [
+        "政策",
+        "条款",
+        "发票",
+        "省"
+      ],
+      "regex_strong": [
+        "[0-9零一二两三四五六七八九十百千两]+折",
+        "满\\s*[0-9零一二两三四五六七八九十百千两]+",
+        "减\\s*[0-9零一二两三四五六七八九十百千两]+",
+        "折[前后]"
+      ],
+      "regex_weak": []
+    },
+    "DELIVERY_QUERY": {
+      "strong": [
+        "到货",
+        "几天",
+        "多久",
+        "交期",
+        "能到",
+        "送到",
+        "发到",
+        "寄",
+        "物流",
+        "快递",
+        "发货",
+        "截单",
+        "顺延",
+        "拿到",
+        "到齐",
+        "加急",
+        "现货",
+        "什么时候到",
+        "预售",
+        "必须到"
+      ],
+      "weak": [
+        "地址",
+        "提交",
+        "这单",
+        "算今天",
+        "算明天"
+      ],
+      "regex_strong": [],
+      "regex_weak": []
+    },
+    "ORDER_CREATE": {
+      "strong": [
+        "下单",
+        "买了",
+        "确认",
+        "草稿",
+        "生成订单",
+        "订单号",
+        "划扣",
+        "执行一下"
+      ],
+      "weak": [],
+      "regex_strong": [],
+      "regex_weak": [
+        "开[个一]?草稿",
+        "来\\s*[0-9零一二两三四五六七八九十百千两]+[台个件]",
+        "买\\s*[0-9零一二两三四五六七八九十百千两]+[台个件]",
+        "直接给我[下生]"
+      ]
+    },
+    "ORDER_QUERY": {
+      "strong": [
+        "到哪了",
+        "到哪一步",
+        "订单状态",
+        "查单",
+        "单子",
+        "物流单号"
+      ],
+      "weak": [
+        "到哪"
+      ],
+      "regex_strong": [],
+      "regex_weak": []
+    },
+    "OUT_OF_SCOPE": {
+      "strong": [
+        "天气",
+        "气温",
+        "下雨",
+        "下雪",
+        "闲聊",
+        "笑话",
+        "新闻",
+        "股票",
+        "球赛",
+        "电影",
+        "提示词",
+        "系统设定",
+        "系统提示",
+        "接口和工具",
+        "工具清单",
+        "银行卡"
+      ],
+      "weak": [],
+      "regex_strong": [],
+      "regex_weak": []
+    },
+    "ESCALATE_HUMAN": {
+      "strong": [
+        "转人工",
+        "人工客服",
+        "投诉",
+        "举报",
+        "找你们领导"
+      ],
+      "weak": [],
+      "regex_strong": [],
+      "regex_weak": []
+    }
+  },
+  "signals": {
+    "_note": "DD-3.1 信号→处置决策表的检测词表（信号仅标注，处置动作由 router 落地）",
+    "coref": [
+      "它",
+      "他们",
+      "这个",
+      "那个",
+      "这款",
+      "那款",
+      "这台",
+      "那台",
+      "刚才",
+      "之前",
+      "上一",
+      "第[一二三四五六七八九十]个",
+      "最后一个",
+      "中间那",
+      "前面那",
+      "后面那",
+      "按之前",
+      "还是按"
+    ],
+    "ellipsis": [
+      "就行",
+      "就要",
+      "不要了",
+      "不用了",
+      "换成",
+      "改成",
+      "都要",
+      "算了",
+      "也要"
+    ],
+    "quantity_ambiguous": [
+      "一批",
+      "一堆",
+      "一些",
+      "若干",
+      "大批",
+      "大量",
+      "全部",
+      "半打",
+      "十来个",
+      "几台",
+      "几个"
+    ]
+  },
+  "slot_hints": {
+    "_note": "product 槽位判定词表（商品名/品类词；型号别名命中另经 model_alias 视为已满足）",
+    "product_terms": [
+      "mac",
+      "imac",
+      "macbook",
+      "显示器",
+      "显示屏",
+      "电脑",
+      "主机"
+    ]
+  },
+  "model_alias": {
+    "_note": "模糊型号别名→sku 索引（DD-3.1 中文归一化行）。真实别名表随 Q1/商品服务联调回填（附录 F Q7）；当前 entries 取自 eval/fixtures/promotion.json SKU_A~D 的 model_alias 字段（占位）。键为 normalize 后形态（小写/斜杠空格归一）。一别名命中多 sku＝实体歧义（决策表行 4 → clarification options[]）。",
+    "pending_question": "Q7",
+    "source": "eval/fixtures/promotion.json#skus[SKU_A..SKU_D].model_alias（占位，禁止硬编码进代码）",
+    "entries": [
+      {
+        "alias": "mac studio m2 ultra 64g/1t",
+        "sku": "SKU_A"
+      },
+      {
+        "alias": "m2 ultra 64g/1t",
+        "sku": "SKU_A"
+      },
+      {
+        "alias": "m2 ultra 64g 1t",
+        "sku": "SKU_A"
+      },
+      {
+        "alias": "64g/1t",
+        "sku": "SKU_A"
+      },
+      {
+        "alias": "64g 1t",
+        "sku": "SKU_A"
+      },
+      {
+        "alias": "m2 ultra",
+        "sku": "SKU_A"
+      },
+      {
+        "alias": "64g",
+        "sku": "SKU_A"
+      },
+      {
+        "alias": "ultra",
+        "sku": "SKU_A"
+      },
+      {
+        "alias": "mac studio m2 ultra 192g/2t",
+        "sku": "SKU_B"
+      },
+      {
+        "alias": "192g/2t",
+        "sku": "SKU_B"
+      },
+      {
+        "alias": "192g 2t",
+        "sku": "SKU_B"
+      },
+      {
+        "alias": "192g",
+        "sku": "SKU_B"
+      },
+      {
+        "alias": "顶配",
+        "sku": "SKU_B"
+      },
+      {
+        "alias": "ultra",
+        "sku": "SKU_B"
+      },
+      {
+        "alias": "mac studio m2 max 32g/1t",
+        "sku": "SKU_C"
+      },
+      {
+        "alias": "m2 max 32g/1t",
+        "sku": "SKU_C"
+      },
+      {
+        "alias": "m2 max",
+        "sku": "SKU_C"
+      },
+      {
+        "alias": "32g/1t",
+        "sku": "SKU_C"
+      },
+      {
+        "alias": "32g 1t",
+        "sku": "SKU_C"
+      },
+      {
+        "alias": "32g",
+        "sku": "SKU_C"
+      },
+      {
+        "alias": "入门",
+        "sku": "SKU_C"
+      },
+      {
+        "alias": "mac studio m2 ultra 64g/2t",
+        "sku": "SKU_D"
+      },
+      {
+        "alias": "64g/2t",
+        "sku": "SKU_D"
+      },
+      {
+        "alias": "64g 2t",
+        "sku": "SKU_D"
+      },
+      {
+        "alias": "2t",
+        "sku": "SKU_D"
+      },
+      {
+        "alias": "ultra",
+        "sku": "SKU_D"
+      }
+    ]
+  },
+  "templates": {
+    "_note": "低置信/槽位缺失/领域外话术模板（DD-3.1『澄清追问』『引导话术』；润色属 IT-2.10 LLM 编排，此处为模板直出基线）",
+    "out_of_scope_guide": "我只处理 Mac Studio 相关的价格、优惠、交期与订单咨询，换个这些问题我来帮您查～",
+    "escalate_ack": "已为您登记转人工请求，将尽快接入人工客服（US-009）。",
+    "clarify_generic": "请再补充一下商品信息或数量，我好为您准确查询。",
+    "clarify_llm_fail": "系统暂时无法确认您的意图，请换个说法，或补充商品与数量信息。",
+    "clarify_quantity_ambiguous": "『{phrase}』的数量不明确，请告知具体台数（例如：3台）。",
+    "clarify_sku_ambiguous": "您指的是以下哪一款？{options}",
+    "clarify_short_input": "您指的是哪一款商品或哪个订单呢？请补充一下。",
+    "clarify_slot": {
+      "PRICE_QUERY": {
+        "product": "请问您要查哪款商品的价格？"
+      },
+      "PROMO_QUERY": {
+        "sku": "请问您想咨询哪款型号的优惠？",
+        "quantity": "请问预计购买几台？（数量影响折扣试算）"
+      },
+      "DELIVERY_QUERY": {
+        "sku": "请问您想咨询哪款型号的交期？",
+        "quantity": "请问预计购买几台？",
+        "address_id": "请提供收货地址，我来为您试算交期。"
+      },
+      "ORDER_CREATE": {
+        "sku": "请确认下单的商品型号。",
+        "quantity": "请问下单几台？",
+        "address_id": "请提供收货地址后再确认草稿。"
+      },
+      "ORDER_QUERY": {
+        "order_id": "请提供订单号；也可以回复“列表”查看您的全部订单。"
+      }
+    }
+  }
+}

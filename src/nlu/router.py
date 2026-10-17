@@ -28,6 +28,21 @@
 - R3：_collect_slots 多候选禁止静默取 cands[0] 且不得把 SKU id 写入 product；
   仅单候选且可映射商品名（命中别名）时回填。
 
+二轮评审整改（N1/N2/N3/N4，修复后可合入）：
+- N1：行 6 领域外判定在小模型段加护栏 `and not follow_up`——域内跟进信号
+  （指代/省略/极短）在 softmax 低分时**不得**按领域外处置（省略/指代本身是
+  域内信号，评审 R1 同源口径），继续下探至降级链末端澄清；LLM 段显式判定
+  OUT_OF_SCOPE 属显式证据，保留；
+- N2：焦点实体继承路径 refs[0] 为 SKU id 形态时仅写 sku，product 须经别名
+  反查命中商品名才回填，否则留空走行 5 澄清（DD-3.3.1：product＝商品名/
+  别名文本，SKU id 直写 product 且 ROUTE 违规）；
+- N3：本轮命中非法/模糊数量表达（qty.ambiguous_phrases 非空，含 "0台"/"3.5台"
+  等 invalid 形态）时 quantity 视同待校验——无论快照携带何种合法值都转澄清
+  并清除快照值（用户显式表达不得被旧快照静默覆盖后 ROUTE；R6 验收），
+  单意图与扇出两路同检；
+- N4：两条"LLM 未接入"降级路径（各层均无证据早退分支与 _run_llm None 分支）
+  统一恰计一次独立事件 nlu.llm_not_wired（attempt=0），消除 DD-11.2 观测盲区。
+
 **零网络**：本模块只产出路由决策对象；API 调用由 IT-2.08 调用器执行，
 决策经 on_api_call sink 记录（OUT_OF_SCOPE/澄清/引导恒不触发，测试以 call-spy 断言）。
 """
@@ -271,7 +286,13 @@ class Pipeline:
                 dec.layer = Layer.SMALL
                 return self._finalize(dec, slots, ctx, qty, cands, signals)
             # 决策表行 6：全部置信 < conf_oos → 领域外处置（禁止 API）
-            if small_best is not None and small_best.confidence < cfg.conf_oos:
+            # N1 护栏（二轮评审）：有指代/省略/极短跟进信号（COREF/ELLIPSIS/
+            # SHORT_INPUT 任一）即不按领域外处置——softmax 低分形态下跟进句
+            # 继续下探至降级链末端澄清（评审 R1"省略/指代本身是域内信号"同源；
+            # 否则 R1 整改后 follow-up 输入首次流经小模型段会被误贴引导话术）。
+            # LLM 段显式判定 OUT_OF_SCOPE 属显式证据，保留（见下方行 6/7）。
+            if (small_best is not None and small_best.confidence < cfg.conf_oos
+                    and not follow_up):
                 return self._issue(self._oos_decision(dec, signals,
                                                       "小模型全部置信低于 conf_oos（DD-3.1 行 6）"))
 
@@ -289,6 +310,11 @@ class Pipeline:
         dec.signals = signals
         if self.llm is None and best is None and small_best is None:
             # 各层均无证据且 LLM 未接入 → 降级链末端澄清（行 7/8/1/2）。
+            # N4 整改（二轮评审）：补发与 _run_llm None 分支同形状的独立事件
+            # nlu.llm_not_wired（attempt=0、不计尝试数/parse_fail）——本轮基线
+            # （无 provider）最高频降级样本不得在 DD-11.2 观测上隐身，两条
+            # 未接入路径口径一致（各恰计一次）。
+            dec.notes_llm_errors = self._emit_llm_not_wired(dec)
             dec.action = Action.CLARIFY
             dec.layer = Layer.FALLBACK
             dec.template, dec.notes = self._follow_up_fallback(
@@ -319,6 +345,8 @@ class Pipeline:
         dec.confidence = conf
         dec.layer = Layer.LLM
         if intent == cat.OUT_OF_SCOPE or conf < cfg.conf_oos:
+            # LLM 显式判定领域外/低置信 → 行 6 处置（显式证据，不受 N1 跟进
+            # 信号护栏影响：小模型 softmax 低分是弱证据，LLM 判定是强证据）
             return self._issue(self._oos_decision(dec, signals,
                                                   "LLM 判定领域外或置信<conf_oos（行 6/7）"))
         if intent == cat.ESCALATE_HUMAN:
@@ -409,6 +437,11 @@ class Pipeline:
         也不得把 SKU id 写入 product——不回填 sku/product，交由 _finalize 出
         options[] 点选；仅单候选且能映射到商品名（命中别名文本，DD-3.3.1
         product 来源＝商品服务名称/别名索引）时才回填 product。
+
+        N2 整改（二轮评审，DD-3.3.1 同源）：焦点实体继承亦不得把 SKU id 写入
+        product——refs[0] 以 SKU 前缀识别时仅写 sku；product 须经别名反查命中
+        商品名才回填，否则留空（必填缺失 → 行 5 定向澄清），禁止携带 SKU id
+        直接 ROUTE。
         """
         alias_matches = alias_matches or []
         slots = {}
@@ -425,10 +458,18 @@ class Pipeline:
         focus = ctx.get("focus_entity") or {}
         refs = focus.get("ref") if isinstance(focus, dict) else None
         if isinstance(refs, list) and len(refs) == 1:
-            if "sku" not in slots and str(refs[0]).upper().startswith("SKU"):
-                slots["sku"] = refs[0]
-            if "product" not in slots:
-                slots["product"] = refs[0]
+            ref = refs[0]
+            if str(ref).upper().startswith("SKU"):
+                # N2：SKU id 形态仅写 sku；product 只在别名反查命中商品名时回填
+                if "sku" not in slots:
+                    slots["sku"] = ref
+                if "product" not in slots:
+                    product_name = self._product_name_for_sku(ref)
+                    if product_name:
+                        slots["product"] = product_name
+            elif "product" not in slots:
+                # 非 SKU id 形态（商品名/别名文本）→ 按 DD-3.3.1 原样继承 product
+                slots["product"] = ref
         # product：商品词表（配置 slot_hints.product_terms）或型号别名命中（别名＝商品名级）
         if "product" not in slots:
             for term in self.cfg.get("slot_hints.product_terms"):
@@ -443,6 +484,19 @@ class Pipeline:
                             slots["product"] = m.alias
                             break
         return slots
+
+    def _product_name_for_sku(self, sku) -> str | None:
+        """N2（二轮评审）：SKU id → 商品名/别名 的反查（DD-3.3.1 product 来源＝
+        商品服务名称/别名索引；单源＝配置 model_alias.entries）。取配置表中该
+        sku 的首个命中别名（配置顺序，确定性可复算）；无命中 → None（product
+        留空，由行 5 必填澄清兜底，禁猜测、禁写回 SKU id）。真实商品名服务查询
+        属商品服务联调回填（附录 F Q7）。
+        """
+        want = str(sku).upper()
+        for entry in self.cfg.alias_entries():
+            if str(entry.get("sku", "")).upper() == want and entry.get("alias"):
+                return entry["alias"]
+        return None
 
     def _rule_multi_intent(self, labels: list) -> list:
         """决策表行 3 的规则侧信号：恰好两个只读意图以同一最高权重强命中
@@ -465,6 +519,10 @@ class Pipeline:
 
         未消解的别名歧义（多候选且 sku 未落槽）按该意图涉及 sku 槽位记为
         缺失『sku』；模糊量词（"一批"）按涉及 quantity 槽位记为缺失『quantity』。
+
+        N3 整改（二轮评审）：本轮命中非法/模糊数量表达（qty.ambiguous_phrases
+        非空）时 quantity 视同待校验——**无论快照携带何种合法值**都记缺失，
+        快照合法值不得静默覆盖本轮显式表达后扇出。
         """
         missing = sorted(s for s in cat.required_slots(intent)
                          if self._slot_missing_value(slots.get(s), s))
@@ -472,9 +530,8 @@ class Pipeline:
         if (len(cands) > 1 and "sku" not in slots and "sku" in relevant
                 and "sku" not in missing):
             missing.append("sku")
-        q = slots.get("quantity")
-        if (qty.ambiguous and "quantity" in relevant and "quantity" not in missing
-                and (q is None or self._slot_missing_value(q, "quantity"))):
+        if (qty.ambiguous and qty.ambiguous_phrases
+                and "quantity" in relevant and "quantity" not in missing):
             missing.append("quantity")
         return missing
 
@@ -575,6 +632,23 @@ class Pipeline:
             return True
         return int(ctx.get("turn_count") or 0) >= self.cfg.complex_turn_threshold
 
+    def _emit_llm_not_wired(self, dec: Decision) -> list:
+        """独立事件 nlu.llm_not_wired（DD-11.2；评审 R5 口径：未注入≠parse_fail）。
+
+        N4 整改（二轮评审）：抽出公共发射器——"各层均无证据且未注入 LLM"早退
+        分支与 _run_llm None 分支同形状、各恰计一次（attempt=0、不产生 LLM
+        尝试数/parse_fail），消除本轮基线（无 provider）最高频降级样本的观测
+        盲区。返回 errors 供 dec.notes_llm_errors 调试位。
+        """
+        errors = ["未注入 LLM provider（本轮基线为可插拔接口）"]
+        self._on_parse_fail({
+            "metric": "nlu.llm_not_wired",
+            "query": dec.query,
+            "attempt": 0,
+            "errors": list(errors),
+        })
+        return errors
+
     def _run_llm(self, norm: str, dec: Decision, small_best):
         """LLM 结构化输出：JSON 解析 + Schema 校验；失败重试 llm_retry_max → None。
 
@@ -591,13 +665,7 @@ class Pipeline:
         errors: list = []
         payload = None
         if self.llm is None:
-            errors = ["未注入 LLM provider（本轮基线为可插拔接口）"]
-            self._on_parse_fail({
-                "metric": "nlu.llm_not_wired",
-                "query": dec.query,
-                "attempt": 0,
-                "errors": list(errors),
-            })
+            errors = self._emit_llm_not_wired(dec)   # N4：与早退分支共用发射器
             dec.notes_llm_errors = errors
             return None, errors, 0, 0
         while attempts <= cfg.llm_retry_max:
@@ -684,12 +752,24 @@ class Pipeline:
         missing = sorted(s for s in required
                          if self._slot_missing_value(dec.slots.get(s), s))
         # 数量模糊（"一批"→触发数量澄清，DD-3.1 归一化行）：任何意图携带 quantity 皆澄清
-        if qty.ambiguous and "quantity" not in missing and dec.slots.get("quantity") is None:
-            missing.append("quantity")
-        q = dec.slots.get("quantity")
-        if q is not None and self._slot_missing_value(q, "quantity") \
-                and "quantity" not in missing:
-            missing.append("quantity")
+        # N3 整改（二轮评审）：本轮命中非法/模糊数量表达（qty.ambiguous_phrases
+        # 非空，含 "0台"/"3.5台" 等 invalid 形态）时 quantity 视同待校验——无论
+        # 快照携带何种合法值都转澄清，并清除快照值防止携带进入 ROUTE（用户显式
+        # 给出的非法表达被旧快照静默覆盖即 R6 验收"0台/3.5台不 ROUTE"的旁路）。
+        if qty.ambiguous and qty.ambiguous_phrases:
+            stale = dec.slots.pop("quantity", None)
+            if "quantity" not in missing:
+                missing.append("quantity")
+            if stale is not None:
+                dec.notes = ((dec.notes + "；") if dec.notes else "") + (
+                    "本轮数量表达非法/模糊（" + "、".join(qty.ambiguous_phrases)
+                    + "），快照 quantity=" + str(stale) + " 已清除并转待校验"
+                    "（二轮评审 N3）")
+        else:
+            q = dec.slots.get("quantity")
+            if q is not None and self._slot_missing_value(q, "quantity") \
+                    and "quantity" not in missing:
+                missing.append("quantity")
         if missing:
             dec.action = Action.CLARIFY
             dec.missing_slots = missing
@@ -717,7 +797,8 @@ class Pipeline:
         parts = []
         for slot in missing:
             if slot == "quantity" and qty is not None and qty.ambiguous:
-                # 模糊量词（"一批"）→ 专用数量澄清话术（DD-3.1 归一化行）
+                # 模糊量词（"一批"）/非法表达（"0台"）→ 专用数量澄清话术
+                # （DD-3.1 归一化行；N3 后含快照覆盖场景）
                 parts.append(cfg.template("clarify_quantity_ambiguous").format(
                     phrase="、".join(qty.ambiguous_phrases) or "您说的数量"))
                 continue

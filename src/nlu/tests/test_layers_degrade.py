@@ -8,6 +8,9 @@
 provider 未注入/调用异常/返回 None 为独立事件 nlu.llm_not_wired / nlu.llm_error，
 不混入 parse_fail。
 
+二轮评审 N4 回归：两条"LLM 未接入"降级路径（各层均无证据早退分支与
+_run_llm None 分支）统一恰计一次 nlu.llm_not_wired，消除观测盲区。
+
 全部 provider 均为内存假实现（零网络、无真实模型）。
 """
 from __future__ import annotations
@@ -273,6 +276,60 @@ class TestLlmSchemaContract(unittest.TestCase):
         self.assertEqual(fails.metric_names(), {"nlu.llm_not_wired"},
                          "未注入 ≠ parse_fail（DD-3.1 L629 仅解析失败计入）")
         self.assertEqual(spy.calls, [])
+
+
+class TestN4LlmNotWiredParity(unittest.TestCase):
+    """N4（二轮评审）：两条"LLM 未接入"降级路径指标口径一致，各恰计一次。
+
+    本轮基线（无 provider）最高频降级样本＝"各层均无证据且未注入 LLM"早退
+    分支（规则/小模型/LLM 全空，如极短输入"嗯"）——原实现不发任何事件，在
+    DD-11.2 观测上隐身；整改后与 _run_llm None 分支共用 _emit_llm_not_wired
+    发射器：同形状事件（metric/query/attempt=0/errors）、恰计一次、不产生
+    llm_attempts/parse_fail。
+    """
+
+    def test_early_exit_branch_emits_not_wired_once(self):
+        """N4 验收：Pipeline(cfg, small=None, llm=None).understand("嗯") →
+        事件集=={nlu.llm_not_wired} count=1，llm_attempts==0、parse_fail==0。"""
+        pipe, spy, fails = make(small=None, llm=None)
+        dec = pipe.understand("嗯")
+        self.assertEqual(dec.action, Action.CLARIFY)
+        self.assertEqual(fails.metric_names(), {"nlu.llm_not_wired"})
+        self.assertEqual(fails.count, 1, "早退分支整改后恰计一次（原为 0＝观测盲区）")
+        ev = fails.events[0]
+        self.assertEqual(ev["query"], "嗯")
+        self.assertEqual(ev["attempt"], 0)
+        self.assertTrue(ev["errors"], "事件携带原因（装配问题非解析失败）")
+        self.assertEqual(dec.llm_attempts, 0)
+        self.assertEqual(dec.parse_fail_events, 0)
+        self.assertEqual(spy.calls, [])
+
+    def test_two_not_wired_paths_same_event_shape(self):
+        """口径一致：路径 A（无证据早退）与路径 B（小模型低分→_run_llm None）
+        发出的事件形状/计数完全一致。"""
+        pipe_a, _, fails_a = make(small=None, llm=None)
+        dec_a = pipe_a.understand("嗯")
+        pipe_b, _, fails_b = make(small=FakeSmallModel({cat.PRICE_QUERY: 0.5}),
+                                  llm=None)
+        dec_b = pipe_b.understand(NEUTRAL)
+        self.assertEqual(fails_a.count, 1)
+        self.assertEqual(fails_b.count, 1)
+        ev_a, ev_b = fails_a.events[0], fails_b.events[0]
+        self.assertEqual(set(ev_a), set(ev_b), "事件键形状一致")
+        self.assertEqual(ev_a["metric"], "nlu.llm_not_wired")
+        self.assertEqual(ev_b["metric"], "nlu.llm_not_wired")
+        self.assertEqual(ev_a["attempt"], ev_b["attempt"])
+        self.assertEqual(dec_a.llm_attempts, dec_b.llm_attempts)
+        self.assertEqual(dec_a.parse_fail_events, dec_b.parse_fail_events)
+
+    def test_not_wired_still_not_counted_as_parse_fail(self):
+        """R5 红线保持（N4 不放宽）：未接入事件不计入 parse_fail/尝试数，
+        澄清行为不变。"""
+        pipe, _, fails = make(small=None, llm=None)
+        dec = pipe.understand("嗯")
+        self.assertNotIn("nlu.parse_fail", fails.metric_names())
+        self.assertEqual(dec.parse_fail_events, 0)
+        self.assertEqual(dec.llm_attempts, 0)
 
 
 class TestHeuristicSmallModelBaseline(unittest.TestCase):

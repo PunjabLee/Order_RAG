@@ -3,6 +3,9 @@
 
 每行断言：信号检测 → 处置动作（Action）→ 话术/路由目标，并校验
 "非路由动作恒不声明 API"（US-007-S4 的决策表侧基线）。
+
+二轮评审整改回归（N1/N2/N3）：行 6 域内跟进信号 OOS 护栏、行 1/8 焦点
+继承 product 口径（DD-3.3.1）、行 5 快照数量覆盖口径。
 """
 from __future__ import annotations
 
@@ -10,6 +13,7 @@ import unittest
 
 from src.nlu import intents as cat
 from src.nlu.config import load_config
+from src.nlu.normalize import extract_quantity
 from src.nlu.router import Action, Layer, Pipeline, RuleLayer, Signal
 from src.nlu.tests.fakes import ApiCallSpy, FakeLlmProvider, FakeSmallModel
 
@@ -31,6 +35,11 @@ def ctx_focus(ref, last_intent, slots=None):
             "slots": slots or {}}
 
 
+def first_alias_for_sku(sku):
+    """按配置单源（model_alias.entries 顺序）取该 sku 的首个别名——N2 反查口径。"""
+    return next(e["alias"] for e in CFG.alias_entries() if e["sku"] == sku)
+
+
 class TestRow1Coreference(unittest.TestCase):
     """行 1 指代词/序数指代 → 焦点实体栈继承；消解证据不足再澄清。"""
 
@@ -48,15 +57,86 @@ class TestRow1Coreference(unittest.TestCase):
         self.assertNotIn("quantity", dec.slots)
 
     def test_inherit_from_focus_stack(self):
+        """行 1 焦点栈继承（SKU id 形态 refs[0]）。
+
+        断言按二轮评审 N2 新口径修正：原用例把 SKU id 写进上下文快照 product
+        （"SKU_C"）后 ROUTE，等价于复刻 N2 违规样本（DD-3.3.1：product＝商品
+        名/别名文本）。修正为纯焦点继承场景：refs[0] 仅落 sku；product 须经
+        别名反查命中商品名才回填（单源＝配置 model_alias 首个命中条目）。
+        """
         pipe, spy = make_pipeline()
-        dec = pipe.understand("那个怎么样",
-                              ctx_focus(["SKU_C"], cat.PRICE_QUERY,
-                                        {"product": "SKU_C"}))
+        dec = pipe.understand("那个怎么样", ctx_focus(["SKU_C"], cat.PRICE_QUERY))
         self.assertEqual(dec.intent, cat.PRICE_QUERY)
         self.assertEqual(dec.confidence, CFG.conf_coref_min)
         self.assertEqual(dec.action, Action.ROUTE)
         self.assertEqual(dec.slots["sku"], "SKU_C")
+        self.assertEqual(dec.slots["product"], first_alias_for_sku("SKU_C"))
+        self.assertFalse(str(dec.slots.get("product", "")).upper().startswith("SKU"),
+                         "N2：product 恒不得为 SKU id")
         self.assertEqual(spy.calls, dec.api_calls)
+
+    def test_n2_focus_sku_ref_never_routes_as_product(self):
+        """N2 验收（单意图路径）：评审实证样本——focus SKU_A + last_intent +
+        快照 quantity，product 只可为别名反查的商品名文本，不得为 SKU id。"""
+        pipe, spy = make_pipeline()
+        dec = pipe.understand("多少钱", {
+            "focus_entity": {"ref": ["SKU_A"]},
+            "last_intent": cat.PRICE_QUERY,
+            "slots": {"quantity": 2}})
+        product = str(dec.slots.get("product", ""))
+        self.assertFalse(product.upper().startswith("SKU"),
+                         f"N2：ROUTE 携带 product={product!r} 为 SKU id")
+        self.assertEqual(product, first_alias_for_sku("SKU_A"))
+        self.assertEqual(dec.slots.get("sku"), "SKU_A")
+        self.assertEqual(dec.action, Action.ROUTE)
+        self.assertEqual(spy.calls, dec.api_calls)
+
+    def test_n2_unknown_sku_focus_falls_to_row5_clarify(self):
+        """N2：SKU 无别名反查命中 → product 留空 → 行 5 必填定向澄清（禁猜测、
+        禁写回 SKU id）。"""
+        pipe, spy = make_pipeline()
+        dec = pipe.understand("多少钱", {
+            "focus_entity": {"ref": ["SKU_ZZ"]},
+            "last_intent": cat.PRICE_QUERY,
+            "slots": {}})
+        self.assertNotIn("product", dec.slots)
+        self.assertEqual(dec.slots.get("sku"), "SKU_ZZ")
+        self.assertEqual(dec.action, Action.CLARIFY)
+        self.assertIn("product", dec.missing_slots)
+        self.assertEqual(dec.api_calls, [])
+        self.assertEqual(spy.calls, [])
+
+    def test_n2_non_sku_ref_inherits_as_product_name(self):
+        """N2 保留面：refs[0] 非 SKU id 形态（商品名/别名文本）→ 按 DD-3.3.1
+        原样继承 product。"""
+        pipe, spy = make_pipeline()
+        dec = pipe.understand("它呢", {
+            "focus_entity": {"ref": ["mac studio"]},
+            "last_intent": cat.PRICE_QUERY,
+            "slots": {"quantity": 1}})
+        self.assertEqual(dec.slots.get("product"), "mac studio")
+        self.assertEqual(dec.action, Action.ROUTE)
+        self.assertEqual(spy.calls, dec.api_calls)
+
+    def test_n2_route_product_invariant_focus_cases(self):
+        """N2 不变式：焦点继承场景（单意图/带上下文两路）ROUTE ⇒
+        slots.product 为商品名/别名文本，恒不以 SKU 开头。"""
+        pipe, _ = make_pipeline()
+        cases = (
+            ("多少钱", {"focus_entity": {"ref": ["SKU_A"]},
+                        "last_intent": cat.PRICE_QUERY, "slots": {"quantity": 2}}),
+            ("那个怎么样", ctx_focus(["SKU_C"], cat.PRICE_QUERY)),
+            ("嗯", ctx_focus(["SKU_B"], cat.DELIVERY_QUERY,
+                             {"sku": "SKU_B", "quantity": 2, "address_id": "ADDR_1"})),
+            ("它呢", ctx_focus(["SKU_ZZ"], cat.PRICE_QUERY)),
+            ("它呢", ctx_focus(["mac studio"], cat.PRICE_QUERY, {"quantity": 1})),
+        )
+        for q, ctx in cases:
+            dec = pipe.understand(q, ctx)
+            with self.subTest(q=q, ref=ctx["focus_entity"]["ref"][0]):
+                self.assertNotEqual(
+                    str(dec.slots.get("product", "")).upper()[:3], "SKU",
+                    f"N2 不变式违背：product={dec.slots.get('product')!r}")
 
     def test_multi_candidate_focus_not_guessed(self):
         """栈顶多候选 → 继承意图但**不猜实体**：必填槽位缺失即定向澄清（行 1/5）。"""
@@ -126,10 +206,13 @@ class TestRow1Coreference(unittest.TestCase):
         self.assertEqual(dec2.template, CFG.template("clarify_short_input"))
 
     def test_resolution_algorithm_owner_is_it_2_03(self):
-        """本轮仅最小可测继承：归属说明写进 notes，便于 IT-2.03 替换。"""
+        """本轮仅最小可测继承：归属说明写进 notes，便于 IT-2.03 替换。
+
+        fixture 按 N2 新口径修正：上下文快照不再以 SKU id 充当 product，
+        焦点继承的商品名经别名反查回填。
+        """
         pipe, _ = make_pipeline()
-        dec = pipe.understand("那台呢", ctx_focus(["SKU_C"], cat.PRICE_QUERY,
-                                                  {"product": "SKU_C"}))
+        dec = pipe.understand("那台呢", ctx_focus(["SKU_C"], cat.PRICE_QUERY))
         self.assertIn("IT-2.03", dec.notes)
 
 
@@ -318,7 +401,11 @@ class TestRow5SlotMissing(unittest.TestCase):
         self.assertEqual(dec.missing_slots, ["product"])
 
     def test_invalid_quantity_never_routes(self):
-        """R6 验收："3.5台/0台/零台" 均不产生 ROUTE（澄清/标待校验）。"""
+        """R6 验收："3.5台/0台/零台" 均不产生 ROUTE（澄清/标待校验）。
+
+        补快照组合（二轮评审 N3）：本轮非法/模糊数量表达 + 快照合法
+        quantity——不得被旧快照值静默覆盖后 ROUTE。
+        """
         pipe, spy = make_pipeline()
         cases = (
             ("Mac Studio 3.5台 多少钱", None),
@@ -327,13 +414,73 @@ class TestRow5SlotMissing(unittest.TestCase):
             ("M2 Max 32G/1T来0台", {"slots": {"address_id": "ADDR_1"}}),
             ("M2 Ultra 64G/1T 多少钱", {"slots": {"quantity": 0}}),
             ("M2 Ultra 64G/1T 3.5台 报价", None),
+            # N3 快照组合：非法/模糊表达 + 快照合法值
+            ("Mac Studio 0台 多少钱", {"slots": {"quantity": 5}}),
+            ("Mac Studio 3.5台 多少钱", {"slots": {"quantity": 5}}),
+            ("M2 Max 32G/1T 一批 有优惠吗", {"slots": {"quantity": 3}}),
+            ("M2 Ultra 64G/1T 0台 多少钱，什么时候能到",
+             {"slots": {"quantity": 2, "address_id": "ADDR_1"}}),
         )
         for q, ctx in cases:
             dec = pipe.understand(q, ctx)
             with self.subTest(q=q, ctx=bool(ctx)):
                 self.assertNotEqual(dec.action, Action.ROUTE, q)
+                self.assertNotEqual(dec.action, Action.FANOUT, q)
                 self.assertEqual(dec.api_calls, [])
         self.assertEqual(spy.calls, [])
+
+    def test_n3_snapshot_quantity_cannot_mask_invalid_expression(self):
+        """N3 验收：评审实证两例（0台/3.5台 + 快照 quantity=5）→ CLARIFY 且
+        quantity ∈ missing_slots；快照值清除不得携带进入下游；notes 说明。"""
+        pipe, spy = make_pipeline()
+        for q in ("Mac Studio 0台 多少钱", "Mac Studio 3.5台 多少钱"):
+            dec = pipe.understand(q, {"slots": {"quantity": 5}})
+            with self.subTest(q=q):
+                self.assertEqual(dec.action, Action.CLARIFY)
+                self.assertIn("quantity", dec.missing_slots)
+                self.assertNotIn("quantity", dec.slots,
+                                 "N3：快照 quantity 须清除，不得携带进入下游")
+                self.assertIn("N3", dec.notes)
+                self.assertEqual(dec.api_calls, [])
+        self.assertEqual(spy.calls, [])
+
+    def test_n3_fanout_side_snapshot_override_blocked(self):
+        """N3 两路同检（扇出侧）：本轮非法/模糊数量表达 + 快照合法值 →
+        不得扇出（_required_missing 口径，L476-478）。"""
+        pipe, spy = make_pipeline()
+        ctx = {"slots": {"quantity": 2, "address_id": "ADDR_1"}}
+        for q in ("M2 Ultra 64G/1T 一批 多少钱，什么时候能到",
+                  "M2 Ultra 64G/1T 0台 多少钱，什么时候能到"):
+            dec = pipe.understand(q, ctx)
+            with self.subTest(q=q):
+                self.assertNotEqual(dec.action, Action.FANOUT)
+                self.assertEqual(dec.action, Action.CLARIFY)
+                self.assertIn("quantity", dec.missing_slots)
+                self.assertEqual(dec.api_calls, [])
+        self.assertEqual(spy.calls, [])
+
+    def test_n3_route_implies_no_invalid_quantity_expression(self):
+        """N3 不变式：ROUTE/FANOUT ⇒ 本轮无 invalid/ambiguous 数量表达
+        （extract_quantity 复算 ambiguous_phrases 恒空）；若携带 quantity 则合法。"""
+        pipe, _ = make_pipeline()
+        queries = ("Mac Studio 0台 多少钱", "Mac Studio 3.5台 多少钱",
+                   "M2 Max 32G/1T 一批 什么时候能到", "零台Mac Studio 报价",
+                   "三台Mac Studio报价", "M2 Ultra 64G/1T多少钱", "来两台顶配")
+        ctxs = (None, {"slots": {"quantity": 5}},
+                {"slots": {"quantity": 2, "address_id": "ADDR_1"}})
+        for q in queries:
+            for ctx in ctxs:
+                dec = pipe.understand(q, ctx)
+                with self.subTest(q=q, ctx=ctx):
+                    if dec.action in (Action.ROUTE, Action.FANOUT):
+                        phrases = extract_quantity(q, CFG).ambiguous_phrases
+                        self.assertEqual(
+                            phrases, [],
+                            f"N3 不变式违背：本轮非法/模糊表达 {phrases} 仍 {dec.action}")
+                        qv = dec.slots.get("quantity")
+                        if qv is not None:
+                            self.assertIsInstance(qv, int)
+                            self.assertGreaterEqual(qv, 1)
 
     def test_route_quantity_invariant_at_least_one(self):
         """R6 不变式：任何 ROUTE/FANOUT 决策若携带 quantity ⇒ quantity≥1。"""
@@ -390,6 +537,36 @@ class TestRow6OutOfScope(unittest.TestCase):
         self.assertEqual(dec.action, Action.GUIDE)
         self.assertEqual(spy.calls, [])
 
+    def test_n1_follow_up_low_softmax_never_guide(self):
+        """N1 验收（行 6 护栏）：小模型全枚举 <conf_oos 的 softmax 低分形态下，
+        域内跟进输入（指代/省略/极短）不得被贴 OUT_OF_SCOPE 引导话术——
+        CLARIFY 承接、intent≠OUT_OF_SCOPE、零 API（spy 恒空）。
+        （R1 整改后 follow-up 首次流经小模型段，无护栏即误判领域外，与
+        『省略/指代本身是域内信号』矛盾；处置下探至降级链末端澄清。）
+        """
+        low = FakeSmallModel({i: CFG.conf_oos - 0.1 for i in cat.INTENTS})
+        pipe, spy = make_pipeline(small=low)
+        for q in ("那个呢", "就要那台，其他不要了", "嗯", "它呢"):
+            dec = pipe.understand(q)
+            with self.subTest(q=q):
+                self.assertEqual(dec.action, Action.CLARIFY)
+                self.assertNotEqual(dec.intent, cat.OUT_OF_SCOPE)
+                self.assertFalse(dec.is_out_of_scope)
+                self.assertEqual(dec.api_calls, [])
+        self.assertEqual(spy.calls, [], "N1：跟进信号澄清路径零 API 记录")
+
+    def test_n1_positive_control_low_softmax_still_guide(self):
+        """N1 保留正控：无跟进信号的领域外串 + 小模型全枚举 <conf_oos →
+        仍按行 6 GUIDE（护栏只豁免 COREF/ELLIPSIS/SHORT_INPUT）。"""
+        low = FakeSmallModel({i: CFG.conf_oos - 0.1 for i in cat.INTENTS})
+        pipe, spy = make_pipeline(small=low)
+        for q in ("咋回事啊", "随便说点什么吧", "你有什么看法呢"):
+            dec = pipe.understand(q)
+            with self.subTest(q=q):
+                self.assertEqual(dec.action, Action.GUIDE)
+                self.assertEqual(dec.intent, cat.OUT_OF_SCOPE)
+        self.assertEqual(spy.calls, [])
+
     def test_llm_declares_out_of_scope(self):
         llm = FakeLlmProvider([FakeLlmProvider.payload(intent=cat.OUT_OF_SCOPE,
                                                       confidence=0.9)])
@@ -398,6 +575,18 @@ class TestRow6OutOfScope(unittest.TestCase):
         self.assertEqual(dec.intent, cat.OUT_OF_SCOPE)
         self.assertEqual(dec.action, Action.GUIDE)
         self.assertEqual(dec.api_calls, [])
+        self.assertEqual(spy.calls, [])
+
+    def test_n1_llm_explicit_oos_still_guide_for_follow_up(self):
+        """N1 边界：LLM 段显式判定 OUT_OF_SCOPE 属显式证据，跟进信号不加豁免
+        （任务卡口径『LLM 段显式判 OUT_OF_SCOPE 可保留』）。"""
+        low = FakeSmallModel({i: CFG.conf_oos - 0.1 for i in cat.INTENTS})
+        llm = FakeLlmProvider([FakeLlmProvider.payload(intent=cat.OUT_OF_SCOPE,
+                                                      confidence=0.9)])
+        pipe, spy = make_pipeline(small=low, llm=llm)
+        dec = pipe.understand("那个呢")
+        self.assertEqual(dec.action, Action.GUIDE)
+        self.assertEqual(dec.intent, cat.OUT_OF_SCOPE)
         self.assertEqual(spy.calls, [])
 
     def test_no_evidence_is_clarify_not_out_of_scope(self):

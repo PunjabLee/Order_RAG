@@ -27,9 +27,13 @@ _CN_CHARS = "".join(_CN_DIGIT) + "".join(_CN_UNIT) + "".join(_CN_SECTION)
 
 #: 数量单位（台/个/件/套）；"俩"＝两个，口语数字单独处理
 _QTY_UNIT_CLASS = "台个件套"
+#: 小数/连号分隔符集（评审 R6）："3.5台"、"1.2.3台"、"29,999台" 整体捕获，
+#: 守卫为 invalid（不猜尾数、不落槽），归入模糊/待校验澄清处置
+_QTY_SEP_CLASS = ".,，。、"
 _QTY_RE = re.compile(
     # 序数『第一个』≠数量（DD-3.2.4 指代属 IT-2.03）：第 之后不取数
-    r"(?P<pre>[-\-]?)\s*(?<!第)(?P<num>\d+|[俩]|[" + _CN_CHARS + r"]+)\s*(?P<unit>[" + _QTY_UNIT_CLASS + r"])"
+    # R6：num 允许吞下 小数/连号 形态（含分隔符）→ 调用方守卫，禁止 \d+ 部分命中取错值
+    r"(?P<pre>[-\-]?)\s*(?<!第)(?P<num>\d+(?:[" + _QTY_SEP_CLASS + r"]\s*\d+)*|[俩]|[" + _CN_CHARS + r"]+)\s*(?P<unit>[" + _QTY_UNIT_CLASS + r"])"
 )
 
 
@@ -91,6 +95,8 @@ class QuantityResult:
     ambiguous: bool = False
     ambiguous_phrases: list = field(default_factory=list)
     negative: bool = False          # "-3台" 类非法输入（IT-2.04 校验拒绝）
+    invalid: bool = False           # 评审 R6：小数/连号（"3.5台"）或 <1（"0台"/"零台"）
+                                    # ——不猜测、不落槽，标记待校验（DD-3.3.1 "1≤q"）
     raw: str = ""
 
     @property
@@ -120,17 +126,35 @@ def extract_quantity(text: str, cfg=None) -> QuantityResult:
         res.values.append(2)
     for m in _QTY_RE.finditer(norm):
         num_txt = m.group("num")
+        frag = m.group(0).strip()
+        if any(ch in num_txt for ch in _QTY_SEP_CLASS):
+            # R6：小数/连号形态（"3.5台"、"1.2.3台"、"29,999台"）→ 不猜尾数，
+            # 标记 invalid 并归入模糊澄清（原实现会静默取 "5" —— 评审实证）
+            res.invalid = True
+            if frag not in res.ambiguous_phrases:
+                res.ambiguous_phrases.append(frag)
+            continue
+        if m.group("pre") in ("-", "－"):
+            res.negative = True
         try:
             val = parse_chinese_number(num_txt)
         except ValueError:
             continue
-        if m.group("pre") in ("-", "－"):
-            res.negative = True
+        if val < 1:
+            # R6：数量 <1（"0台"、"零台"）与 DD-3.3.1 "1≤q" 及本模块 LLM
+            # Schema entities.quantity minimum:1 冲突 → invalid，不落槽
+            res.invalid = True
+            if frag not in res.ambiguous_phrases:
+                res.ambiguous_phrases.append(frag)
+            continue
         if val not in res.values:
             res.values.append(val)
+    if res.invalid:
+        # invalid 一律归入"模糊/待校验"处置（澄清而非路由；不猜测原值）
+        res.ambiguous = True
     if res.values:
         res.value = res.values[0] if len(set(res.values)) == 1 else None
-        if res.negative:
+        if res.negative or res.invalid:
             res.value = None
     elif res.ambiguous:
         res.value = None

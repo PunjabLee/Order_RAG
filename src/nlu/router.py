@@ -6,7 +6,9 @@
 2. 小模型（provider 可注入；≥conf_low 采纳）→ 路由；
 3. 低于 conf_low 或多轮复杂 → LLM 结构化输出（JSON Schema 约束、intent 枚举
    受限、additionalProperties:false）；解析失败重试 llm_retry_max 次 →
-   降级小模型结果 → 模板澄清；失败计入 nlu.parse_fail 指标回调（DD-11.2）。
+   降级小模型结果 → 模板澄清；**解析失败**计入 nlu.parse_fail 指标回调
+   （DD-11.2；provider 未注入/异常为独立事件 nlu.llm_not_wired / nlu.llm_error，
+   不混入 parse_fail —— 评审 R5）。
 
 信号→处置决策表（8 行）逐行落地于 _detect_signals/_finalize：
   1 指代/序数      → 标注 coref，消解算法属 IT-2.03（DD-3.2.4）；置信<conf_low 再澄清
@@ -463,15 +465,27 @@ class Pipeline:
         缺失『sku』；模糊量词（"一批"）按涉及 quantity 槽位记为缺失『quantity』。
         """
         missing = sorted(s for s in cat.required_slots(intent)
-                         if slots.get(s) in (None, ""))
+                         if self._slot_missing_value(slots.get(s), s))
         relevant = cat.slots_of(intent)   # 该意图可携带的全部槽位（required∪optional）
         if (len(cands) > 1 and "sku" not in slots and "sku" in relevant
                 and "sku" not in missing):
             missing.append("sku")
+        q = slots.get("quantity")
         if (qty.ambiguous and "quantity" in relevant and "quantity" not in missing
-                and slots.get("quantity") is None):
+                and (q is None or self._slot_missing_value(q, "quantity"))):
             missing.append("quantity")
         return missing
+
+    @staticmethod
+    def _slot_missing_value(v, slot: str) -> bool:
+        """槽位缺失口径（评审 R6）：None/空串＝缺失；quantity 必须为 ≥1 的整数
+        （DD-3.3.1 "1≤q"、本模块 LLM Schema minimum:1）——0/负数/小数等非法值
+        视同缺失，交澄清链路，禁止携带进入 ROUTE/FANOUT 决策。"""
+        if v is None or v == "":
+            return True
+        if slot == "quantity":
+            return isinstance(v, bool) or not isinstance(v, int) or v < 1
+        return False
 
     def _fanout_decision(self, dec: Decision, labels: list, slots: dict,
                          cands: list, qty: QuantityResult,
@@ -562,46 +576,72 @@ class Pipeline:
     def _run_llm(self, norm: str, dec: Decision, small_best):
         """LLM 结构化输出：JSON 解析 + Schema 校验；失败重试 llm_retry_max → None。
 
-        指标口径（DD-3.1 L629，评审 R5）：**仅 JSON/Schema 解析失败**逐次计入
-        nlu.parse_fail；provider 未注入/调用异常/返回 None 属可用性事件
-        （nlu.llm_not_wired / nlu.llm_error），不混入 parse_fail。
+        指标口径（DD-3.1 L629，评审 R5 整改）：**仅 JSON/Schema 解析失败**逐次
+        计入 nlu.parse_fail；provider 未注入属装配问题（独立事件
+        nlu.llm_not_wired，计一次、不计尝试数）；provider 异常/返回 None 属
+        调用可用性问题（独立事件 nlu.llm_error，逐次计）——均不混入 parse_fail。
+        返回 (payload, errors, attempts, parse_fail_count)。
         """
         cfg = self.cfg
         schema = build_nlu_schema()
         attempts = 0
-        fails = 0
+        fails = 0                     # nlu.parse_fail 事件数（纯解析失败口径）
         errors: list = []
         payload = None
+        if self.llm is None:
+            errors = ["未注入 LLM provider（本轮基线为可插拔接口）"]
+            self._on_parse_fail({
+                "metric": "nlu.llm_not_wired",
+                "query": dec.query,
+                "attempt": 0,
+                "errors": list(errors),
+            })
+            dec.notes_llm_errors = errors
+            return None, errors, 0, 0
         while attempts <= cfg.llm_retry_max:
             attempts += 1
             raw = None
-            if self.llm is not None:
-                try:
-                    raw = self.llm.generate(dec.query, schema, attempts)
-                except Exception as exc:  # provider 异常视作解析失败进入降级链
-                    errors = [f"provider_error: {exc}"]
-            else:
-                errors = ["未注入 LLM provider（本轮基线为可插拔接口）"]
-            if raw is not None:
-                try:
-                    parsed = json.loads(raw) if isinstance(raw, str) else raw
-                except (json.JSONDecodeError, TypeError) as exc:
-                    errors = [f"json_parse: {exc}"]
-                    parsed = None
-                if parsed is not None:
-                    errs = validate_nlu_output(parsed, schema)
-                    if not errs and parsed.get("intent") in cat.INTENT_SET:
-                        payload = parsed
-                        break
-                    errors = errs or ["intent 不在七枚举"]
-            # 本次尝试失败 → 计指标 + 重试
-            fails += 1
-            self._on_parse_fail({
-                "metric": "nlu.parse_fail",
-                "query": dec.query,
-                "attempt": attempts,
-                "errors": list(errors),
-            })
+            unavailable = False
+            try:
+                raw = self.llm.generate(dec.query, schema, attempts)
+            except Exception as exc:  # provider 异常 → 降级链；计 llm_error 非 parse_fail（R5）
+                errors = [f"provider_error: {exc}"]
+                unavailable = True
+            if raw is None and not unavailable:
+                errors = ["provider 返回 None（调用失败）"]
+                unavailable = True
+            if unavailable:
+                self._on_parse_fail({
+                    "metric": "nlu.llm_error",
+                    "query": dec.query,
+                    "attempt": attempts,
+                    "errors": list(errors),
+                })
+                if attempts > cfg.llm_retry_max:
+                    break
+                continue
+            parse_failed = True
+            try:
+                parsed = json.loads(raw) if isinstance(raw, str) else raw
+            except (json.JSONDecodeError, TypeError) as exc:
+                errors = [f"json_parse: {exc}"]
+                parsed = None
+            if parsed is not None:
+                errs = validate_nlu_output(parsed, schema)
+                if not errs and parsed.get("intent") in cat.INTENT_SET:
+                    payload = parsed
+                    parse_failed = False
+                    break
+                errors = errs or ["intent 不在七枚举"]
+            if parse_failed:
+                # 纯 JSON/Schema 解析失败 → 逐次计入 nlu.parse_fail（DD-11.2）
+                fails += 1
+                self._on_parse_fail({
+                    "metric": "nlu.parse_fail",
+                    "query": dec.query,
+                    "attempt": attempts,
+                    "errors": list(errors),
+                })
             if attempts > cfg.llm_retry_max:
                 break
         dec.notes_llm_errors = errors  # 调试用（不进 trace 契约）
@@ -636,10 +676,17 @@ class Pipeline:
             return self._issue(dec)
 
         # 行 1：省略句 → 快照补全（_collect_slots 已做），仍缺必填 → 澄清
+        # R6 整改：quantity 携带非法值（<1/非整数，含快照注入）视同缺失——
+        # route 决策恒携带 quantity≥1（DD-3.3.1 "1≤q"、Schema minimum:1）
         required = cat.required_slots(intent)
-        missing = sorted(s for s in required if dec.slots.get(s) in (None, ""))
+        missing = sorted(s for s in required
+                         if self._slot_missing_value(dec.slots.get(s), s))
         # 数量模糊（"一批"→触发数量澄清，DD-3.1 归一化行）：任何意图携带 quantity 皆澄清
         if qty.ambiguous and "quantity" not in missing and dec.slots.get("quantity") is None:
+            missing.append("quantity")
+        q = dec.slots.get("quantity")
+        if q is not None and self._slot_missing_value(q, "quantity") \
+                and "quantity" not in missing:
             missing.append("quantity")
         if missing:
             dec.action = Action.CLARIFY

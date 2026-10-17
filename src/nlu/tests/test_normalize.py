@@ -98,6 +98,32 @@ class TestExtractQuantity(unittest.TestCase):
         self.assertTrue(r.negative)
         self.assertIsNone(r.value)
 
+    def test_decimal_or_runon_quantity_never_guessed(self):
+        """R6 验收：小数/连号不猜尾数（原实现 "3.5台"→5 静默取错）。"""
+        for bad in ("3.5台", "1.2.3台", "买29,999台", "要 3.5 台"):
+            r = extract_quantity(bad, CFG)
+            with self.subTest(q=bad):
+                self.assertTrue(r.invalid, bad)
+                self.assertTrue(r.ambiguous, "invalid 归入模糊/待校验处置")
+                self.assertIsNone(r.value, bad)
+                self.assertTrue(r.ambiguous_phrases, bad)
+
+    def test_below_one_quantity_marked_invalid(self):
+        """R6 验收："0台"/"零台" 与 DD-3.3.1 "1≤q" 冲突 → invalid，不路由。"""
+        for bad in ("0台", "零台", "来0台"):
+            r = extract_quantity(bad, CFG)
+            with self.subTest(q=bad):
+                self.assertTrue(r.invalid, bad)
+                self.assertIsNone(r.value, bad)
+                self.assertNotIn(0, r.values, "非法值不得进入 values")
+
+    def test_one_is_valid_minimum(self):
+        """边界：quantity=1 合法（DD-3.3.1 "1≤q"）。"""
+        r = extract_quantity("要1台", CFG)
+        self.assertEqual(r.value, 1)
+        self.assertFalse(r.invalid)
+        self.assertFalse(r.ambiguous)
+
     def test_ordinal_is_not_quantity(self):
         """序数『第一个』≠ 数量（指代消解属 IT-2.03/DD-3.2.4）。"""
         r = extract_quantity("第一个到了吗", CFG)

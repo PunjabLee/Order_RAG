@@ -317,6 +317,43 @@ class TestRow5SlotMissing(unittest.TestCase):
         self.assertEqual(dec.intent, cat.PRICE_QUERY)
         self.assertEqual(dec.missing_slots, ["product"])
 
+    def test_invalid_quantity_never_routes(self):
+        """R6 验收："3.5台/0台/零台" 均不产生 ROUTE（澄清/标待校验）。"""
+        pipe, spy = make_pipeline()
+        cases = (
+            ("Mac Studio 3.5台 多少钱", None),
+            ("Mac Studio 0台 多少钱", None),
+            ("零台Mac Studio 报价", None),
+            ("M2 Max 32G/1T来0台", {"slots": {"address_id": "ADDR_1"}}),
+            ("M2 Ultra 64G/1T 多少钱", {"slots": {"quantity": 0}}),
+            ("M2 Ultra 64G/1T 3.5台 报价", None),
+        )
+        for q, ctx in cases:
+            dec = pipe.understand(q, ctx)
+            with self.subTest(q=q, ctx=bool(ctx)):
+                self.assertNotEqual(dec.action, Action.ROUTE, q)
+                self.assertEqual(dec.api_calls, [])
+        self.assertEqual(spy.calls, [])
+
+    def test_route_quantity_invariant_at_least_one(self):
+        """R6 不变式：任何 ROUTE/FANOUT 决策若携带 quantity ⇒ quantity≥1。"""
+        pipe, _ = make_pipeline()
+        queries = ("M2 Ultra 64G/1T多少钱", "三台Mac Studio报价",
+                   "M2 Max 32G/1T 一批 什么时候能到", "来两台顶配",
+                   "Ultra那款多少钱", "0台Mac Studio多少钱",
+                   "Mac Studio 3.5台 多少钱")
+        ctxs = (None, {"slots": {"quantity": 0}}, {"slots": {"quantity": 5}})
+        for q in queries:
+            for ctx in ctxs:
+                dec = pipe.understand(q, ctx)
+                with self.subTest(q=q, ctx=ctx):
+                    if dec.action in (Action.ROUTE, Action.FANOUT):
+                        qv = dec.slots.get("quantity")
+                        if qv is not None:
+                            self.assertIsInstance(qv, int)
+                            self.assertGreaterEqual(qv, 1,
+                                                    "route 决策 quantity≥1 恒成立")
+
 
 class TestRow6OutOfScope(unittest.TestCase):
     """行 6 领域外：intent=OUT_OF_SCOPE 或全部置信<conf_oos → 引导话术，禁止 API。"""

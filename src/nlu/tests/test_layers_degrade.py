@@ -4,7 +4,9 @@
 链路：规则/词表（≥conf_rule_strong 直路由）→ 小模型（≥conf_low 采纳）
 → 低于 conf_low 或多轮复杂升级 LLM（JSON Schema 约束）→
 解析失败重试 llm_retry_max 次 → 降级小模型结果 → 模板澄清；
-每次失败即时计入 nlu.parse_fail 指标回调（DD-11.2）。
+**仅 JSON/Schema 解析失败**逐次计入 nlu.parse_fail（DD-3.1 L629，评审 R5）；
+provider 未注入/调用异常/返回 None 为独立事件 nlu.llm_not_wired / nlu.llm_error，
+不混入 parse_fail。
 
 全部 provider 均为内存假实现（零网络、无真实模型）。
 """
@@ -100,6 +102,16 @@ class TestDegradeChain(unittest.TestCase):
         self.assertEqual(set(("metric", "query", "attempt", "errors")) - set(ev), set())
         self.assertEqual(ev["attempt"], 1)
 
+    def test_pure_parse_failure_still_counts_parse_fail(self):
+        """R5 对照：纯 JSON/Schema 解析失败逐次计 nlu.parse_fail（口径不放宽）。"""
+        llm = FakeLlmProvider(["非 JSON {{"])
+        pipe, _, fails = make(llm=llm)
+        dec = pipe.understand(NEUTRAL)
+        self.assertEqual(fails.metric_names(), {"nlu.parse_fail"})
+        self.assertEqual(fails.count, CFG.llm_retry_max + 1)
+        self.assertEqual(dec.parse_fail_events, CFG.llm_retry_max + 1)
+        self.assertEqual(dec.llm_attempts, CFG.llm_retry_max + 1)
+
     def test_retry_then_success(self):
         good = FakeLlmProvider.payload(intent=cat.PRICE_QUERY, confidence=0.9,
                                        entities={"product": "mac studio"})
@@ -126,6 +138,9 @@ class TestDegradeChain(unittest.TestCase):
         self.assertEqual(dec.action, Action.ROUTE)
         self.assertIn("降级小模型", dec.notes)
         self.assertEqual(fails.count, CFG.llm_retry_max + 1)
+        # R5：provider 返回 None＝可用性事件，逐次计 llm_error、不计 parse_fail
+        self.assertEqual(fails.metric_names(), {"nlu.llm_error"})
+        self.assertEqual(dec.parse_fail_events, 0)
         self.assertEqual(spy.calls, dec.api_calls)
 
     def test_provider_exception_enters_degrade_chain(self):
@@ -135,6 +150,9 @@ class TestDegradeChain(unittest.TestCase):
         self.assertEqual(dec.action, Action.CLARIFY)
         self.assertEqual(fails.count, 2)
         self.assertIn("provider_error", json.dumps(fails.events, ensure_ascii=False))
+        # R5：异常逐次计 nlu.llm_error（独立事件名），不污染 parse_fail 口径
+        self.assertEqual(fails.metric_names(), {"nlu.llm_error"})
+        self.assertEqual(dec.parse_fail_events, 0)
 
     def test_retry_count_comes_from_config(self):
         cfg = load_config(env={"NLU_LLM_RETRY_MAX": "2"})
@@ -242,15 +260,18 @@ class TestLlmSchemaContract(unittest.TestCase):
                          list(cat.INTENTS))
 
     def test_llm_provider_absent_clarifies_without_crash(self):
-        """未注入 LLM（本轮基线）：小模型有低分证据 → 降级链末端模板澄清。"""
+        """R5 口径：未注入 LLM（本轮基线）→ **不计任何解析类指标**——独立事件
+        nlu.llm_not_wired、llm_attempts=0；降级链末端模板澄清行为保持。"""
         small = FakeSmallModel({cat.PRICE_QUERY: 0.5})
         pipe, spy, fails = make(small=small, llm=None)
         dec = pipe.understand(NEUTRAL)
         self.assertEqual(dec.action, Action.CLARIFY)
         self.assertEqual(dec.template, CFG.template("clarify_llm_fail"))
-        self.assertEqual(dec.llm_attempts, CFG.llm_retry_max + 1)
-        self.assertEqual(fails.count, CFG.llm_retry_max + 1,
-                         "无 provider 亦计入 parse_fail（可观测性，禁静默）")
+        self.assertEqual(dec.llm_attempts, 0, "未注入不产生 LLM 尝试数")
+        self.assertEqual(dec.parse_fail_events, 0)
+        self.assertEqual(fails.count, 1, "可观测性由独立事件承载（禁静默）")
+        self.assertEqual(fails.metric_names(), {"nlu.llm_not_wired"},
+                         "未注入 ≠ parse_fail（DD-3.1 L629 仅解析失败计入）")
         self.assertEqual(spy.calls, [])
 
 

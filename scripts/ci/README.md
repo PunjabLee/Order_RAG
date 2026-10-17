@@ -52,7 +52,7 @@ docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.21.2 detect --sourc
 ## 与流水线的关系
 
 `.github/workflows/ci.yaml`（GitHub Actions 语法）按序执行七步：commit-msg 范围校验 →
-mermaid 检查 → 金额复算 → 单元自测（双 discover：工程骨架 26 项 + 业务 nlu 166 项，IT-2.02 起）→
+mermaid 检查 → 金额复算 → 单元自测（双 discover：工程骨架 26 项 + 业务 nlu 170 项，IT-2.02 起）→
 评测集结构回归（validate_schema.py）→
 契约 lint（redocly，Gate 6，评审 H-1 补位）→ DLP 凭据扫描（gitleaks，Gate 7 最小实现）；
 评测语义回归（IT-2.05）、双消费者契约测试（IT-1.09 冻结）、PII 自研规则（IT-3.09）仍为

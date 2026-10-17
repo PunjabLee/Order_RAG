@@ -25,7 +25,7 @@ python3 scripts/ci/check_mermaid.py                 # mermaid 围栏配对/语�
 python3 scripts/ci/recalc_amount.py                 # DD-8.1 金额独立复算（应得 8049700 分）
 python3 eval/metrics/validate_schema.py             # 评测集 200 条结构校验
 python3 -m unittest discover -s scripts/ci/tests    # CI 脚本单测（26 项）
-python3 -m unittest discover -s src/nlu/tests -t .   # 查询理解单测（166 项：归一化/决策表/降级链/零API/守卫）
+python3 -m unittest discover -s src/nlu/tests -t .   # 查询理解单测（170 项：归一化/决策表/降级链/零API/守卫）
 python3 eval/metrics/intent_accuracy.py --layer rule  # 意图准确率夹具评测（非阻断；当前实测 0.8350<0.92，欠账见计划 §9.2 L-06，禁改门槛蒙混）
 ```
 
@@ -63,7 +63,7 @@ python3 eval/metrics/intent_accuracy.py --layer rule  # 意图准确率夹具评
 
 ```
 contracts/          # OpenAPI 契约（chat/orders/sessions/feedback/escalate/notifications + errors-dict + shared-schemas + redocly.yaml）
-src/nlu/            # IT-2.02 查询理解：intents(枚举单源)/config+config_data(阈值词表单源)/router(分层管线)/normalize/schema/providers + tests(166)
+src/nlu/            # IT-2.02 查询理解：intents(枚举单源)/config+config_data(阈值词表单源)/router(分层管线)/normalize/schema/providers + tests(170)
 eval/               # ANNOTATION_GUIDE.md / golden-set-v1(5批次200条) / fixtures / metrics(校验脚本)
 scripts/ci/         # commit-msg 校验器 / mermaid 检查 / 金额复算 / 单测 / pricing_baseline.json(假设值配置)
 docs/adr/           # ADR 模板与待归档清单

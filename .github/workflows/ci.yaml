@@ -8,7 +8,11 @@ name: ci
 
 on:
   pull_request:
-    branches: [develop, main]
+    # chore/** 临时扩展（终轮 F1 / 台账 L-08）：stacked PR #2 的 base 为
+    # chore/repo-skeleton，GitHub 取 base 分支的 workflow 定义，PR #1 未合入前
+    # 需 head 分支同时把 chore/** 列入触发集才能跑到 CI；PR #1 合入后
+    # 本行随 re-base 收敛回 [develop, main]（入 §9.4 PR 行备注）
+    branches: [develop, main, chore/**]
   push:
     branches: [develop, main]
 

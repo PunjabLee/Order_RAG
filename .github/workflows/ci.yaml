@@ -8,7 +8,11 @@ name: ci
 
 on:
   pull_request:
-    branches: [develop, main]
+    # chore/** 临时扩展（终轮 F1 / 台账 L-08）：stacked PR #2 的 base 为
+    # chore/repo-skeleton，GitHub 取 base 分支的 workflow 定义，PR #1 未合入前
+    # 需 head 分支同时把 chore/** 列入触发集才能跑到 CI；PR #1 合入后
+    # 本行随 re-base 收敛回 [develop, main]（入 §9.4 PR 行备注）
+    branches: [develop, main, chore/**]
   push:
     branches: [develop, main]
 
@@ -50,8 +54,21 @@ jobs:
         run: python3 scripts/ci/recalc_amount.py
 
       # ── 步骤 4/7：单元自测（单测框架种子，DD-13 单元层） ────────────────────
+      # IT-2.02 起含查询理解单测（src/nlu/tests）：归一化用例集 / 决策表 8 行逐行 /
+      # 分层降级链（纯 JSON/Schema 解析失败计入 nlu.parse_fail；provider 异常/缺位另计
+      # nlu.llm_error / nlu.llm_not_wired，评审 R5 口径拆分）/
+      # US-007-S4 领域外零 API 调用（call-spy）/ 配置缺键致命（禁静默兜底）。
       - name: Gate 4 · unit self-tests (stdlib unittest)
-        run: python3 -m unittest discover -s scripts/ci/tests -v
+        run: |
+          python3 -m unittest discover -s scripts/ci/tests -v
+          python3 -m unittest discover -s src/nlu/tests -t . -v
+        # TODO(G-B 非阻断评测槽位)：意图准确率评测不进绿灯门禁——
+        #   python3 eval/metrics/intent_accuracy.py --layer rule --min-accuracy 0.92
+        #   当前规则层实测 83.5%（full 层含夹具上下文注入后增量 0，评审 R4 修复后实测）；
+        #   根因订正（评审 C2）：旧注释归因"属小模型/LLM 层"失真——路由早退旁路已由 R1 修复（提交 7cb0bfc），
+        #   剩余缺口主因是夹具上下文无意图级继承证据（last_intent 属会话服务读侧/IT-2.03）与真实模型缺位；
+        #   欠账权威落点见计划 §9.2 L-06；阈值标定属 G-B，接入后以 continue-on-error 步骤引入，
+        #   禁止在门槛未达标时置绿。
 
       # ── 步骤 5/7：评测集结构回归（评审 H-1 补位；语义指标回归仍留 IT-2.05） ────
       - name: Gate 5 · eval golden-set schema check
@@ -81,6 +98,6 @@ jobs:
       # ══ 仍预留的槽位（依赖外部条件，触发任务见注释） ════════════════════════
       # TODO: IT-1.09 冻结评审 —— mock server 起服 + 前端/交易双消费者契约测试（L-05 解欠前置）。
       # TODO: IT-2.05 —— 评测语义回归：Recall@5 ≥ 0.9 / 政策命中 ≥ 0.95 / 幻觉率门禁（需检索链路）。
-      # TODO: IT-2.x —— 业务单测/契约测试并入 Gate 4（目录约定 tests/ + discover，夹具来自 IT-1.07）。
+      # TODO: IT-2.x —— 其余业务单测/契约测试并入 Gate 4（目录约定 tests/ + discover，夹具来自 IT-1.07；IT-2.02 nlu 已并入）。
       # TODO: IT-3.09 —— DLP 扩展自研 PII 规则（手机号/身份证/地址精确，DD-5.5 口径）。
       # TODO: 附录 D 完整渲染 —— mermaid-cli（@mermaid-js/mermaid-cli）headless 渲染全部图至 SVG，待运维排期。

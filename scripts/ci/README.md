@@ -14,7 +14,7 @@
 | `check_mermaid.py` | 扫描 `*.md`：``` 围栏配对（奇数报错）、mermaid 语法头识别（flowchart/graph/stateDiagram/sequenceDiagram）、块内字面 `\n`（附录 D L-3 要求 `<br/>`）；输出文件+围栏号+行号 | `python3 scripts/ci/check_mermaid.py`（默认全仓，可传文件/目录参数） |
 | `recalc_amount.py` | 按 DD-8.1 独立复算示例金额（纯整数分）并 grep 设计文档 `total_cents`/展示值/减法链比对，不一致即报 | `python3 scripts/ci/recalc_amount.py`；`--no-doc` 只复算 |
 | `pricing_baseline.json` | 复算基线参数（单价分/数量/折扣bp/券分/叠加顺序/舍入步长）。**全部为假设值，挂 Q1/Q7，禁止业务代码硬编码（DD-16 R-07）**；IT-1.07 联调后替换 | 被 `recalc_amount.py` 默认读取 |
-| `tests/test_ci_checks.py` | 上述三个校验器的单元自测（DD-13"单元层"骨架种子） | `python3 -m unittest discover -s scripts/ci/tests` |
+| `tests/test_ci_checks.py` | 上述三个校验器的单元自测（26 项，DD-13"单元层"骨架种子；业务模块单测另在 `src/nlu/tests`，Gate 4 双 discover） | `python3 -m unittest discover -s scripts/ci/tests` |
 
 ## commit-msg 规则与豁免白名单
 
@@ -41,7 +41,9 @@ sh scripts/ci/install-hooks.sh                          # 装钩子（git config
 python3 scripts/ci/check_commit_msg.py --range origin/develop..HEAD  # Gate 1 提交规范
 python3 scripts/ci/check_mermaid.py                     # Gate 2 mermaid 检查
 python3 scripts/ci/recalc_amount.py                     # Gate 3 金额复算 + 文档比对
-python3 -m unittest discover -s scripts/ci/tests        # Gate 4 单元自测
+python3 -m unittest discover -s scripts/ci/tests        # Gate 4 单元自测（上）
+python3 -m unittest discover -s src/nlu/tests -t .      # Gate 4 查询理解单测（下，IT-2.02 起）
+python3 eval/metrics/intent_accuracy.py --layer rule    # Gate 4 后非阻断评测槽位（当前如实 FAIL 0.8350，不进绿灯，见计划 §9.2 L-06）
 python3 eval/metrics/validate_schema.py                 # Gate 5 评测集结构回归
 npx --yes @redocly/cli lint --config contracts/redocly.yaml contracts/{chat,orders,sessions,feedback,escalate,notifications,shared-schemas}-v1.yaml 2>/dev/null || npx --yes @redocly/cli lint --config contracts/redocly.yaml $(ls contracts/*.yaml | grep -vE 'redocly|errors-dict')   # Gate 6 契约 lint
 docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.21.2 detect --source=/repo --redact --no-banner   # Gate 7 DLP（需 docker）
@@ -50,10 +52,11 @@ docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.21.2 detect --sourc
 ## 与流水线的关系
 
 `.github/workflows/ci.yaml`（GitHub Actions 语法）按序执行七步：commit-msg 范围校验 →
-mermaid 检查 → 金额复算 → 单元自测 → 评测集结构回归（validate_schema.py）→
+mermaid 检查 → 金额复算 → 单元自测（双 discover：工程骨架 26 项 + 业务 nlu 170 项，IT-2.02 起）→
+评测集结构回归（validate_schema.py）→
 契约 lint（redocly，Gate 6，评审 H-1 补位）→ DLP 凭据扫描（gitleaks，Gate 7 最小实现）；
 评测语义回归（IT-2.05）、双消费者契约测试（IT-1.09 冻结）、PII 自研规则（IT-3.09）仍为
-声明的 TODO 槽位。**GitLab CI / Jenkins 用户**：将上述七步映射为 script 阶段即可，卡口语义
+声明的 TODO 槽位；意图准确率夹具评测（intent_accuracy.py）已交付但按 L-06 欠账保持非阻断。**GitLab CI / Jenkins 用户**：将上述七步映射为 script 阶段即可，卡口语义
 （返回码非 0 阻断）不变；§8.2 `develop` 保护要求"CI 绿"即指本流水线。
 
 ## 边界（本目录刻意不做的事）

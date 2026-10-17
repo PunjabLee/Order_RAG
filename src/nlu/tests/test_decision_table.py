@@ -149,6 +149,34 @@ class TestRow1Coreference(unittest.TestCase):
         self.assertIn("product", dec.missing_slots)
         self.assertEqual(spy.calls, [])
 
+    def test_f3_focus_snapshot_sku_mismatch_no_product_backfill(self):
+        """F3 验收（终轮评审）：焦点 ref 与快照 sku 错配 → 不得把焦点别名的
+        商品名回填进 product（防跨实体错配 ROUTE）；生效 sku 保持快照值，
+        product 留空→行 5 定向澄清。"""
+        pipe, spy = make_pipeline()
+        dec = pipe.understand("多少钱", {
+            "focus_entity": {"ref": ["SKU_A"]},
+            "last_intent": cat.PRICE_QUERY,
+            "slots": {"sku": "SKU_B", "quantity": 2}})
+        self.assertEqual(dec.slots.get("sku"), "SKU_B", "错配时快照 sku 不得被焦点 ref 覆写")
+        self.assertNotIn(
+            "product", dec.slots,
+            f"F3：错配焦点 {first_alias_for_sku('SKU_A')!r} 不得回填 product（sku=SKU_B）")
+        self.assertNotEqual(dec.action, Action.ROUTE, "F3：跨实体错配不得 ROUTE")
+        self.assertEqual(spy.calls, [])
+
+    def test_f3_matched_focus_still_backfills_product(self):
+        """F3 正控（防修复过头）：焦点 ref 与快照 sku 一致 → N2 别名反查回填
+        路径保持可用，ROUTE 携带商品名 product。"""
+        pipe, spy = make_pipeline()
+        dec = pipe.understand("多少钱", {
+            "focus_entity": {"ref": ["SKU_A"]},
+            "last_intent": cat.PRICE_QUERY,
+            "slots": {"sku": "SKU_A", "quantity": 2}})
+        self.assertEqual(dec.slots.get("product"), first_alias_for_sku("SKU_A"))
+        self.assertEqual(dec.action, Action.ROUTE)
+        self.assertEqual(spy.calls, dec.api_calls)
+
     def test_coref_no_evidence_escalates_to_llm(self):
         """R1 验收：有指代信号+无继承证据+规则未命中 → 小模型/LLM 层不得被
         旁路（DD-3.1 行 7『低置信→升级 LLM』结构性可达）。"""
@@ -457,6 +485,27 @@ class TestRow5SlotMissing(unittest.TestCase):
                 self.assertEqual(dec.action, Action.CLARIFY)
                 self.assertIn("quantity", dec.missing_slots)
                 self.assertEqual(dec.api_calls, [])
+        self.assertEqual(spy.calls, [])
+
+    def test_f2_fanout_pending_clears_stale_snapshot_quantity(self):
+        """F2 验收（终轮评审）：扇出 pending 分支 N3 两路同检补全——本轮非法/
+        模糊数量表达 + 快照合法值 → CLARIFY 且快照 quantity 从 dec.slots 清除
+        （对齐 _finalize N3），notes 携带清除说明与 F2 锚点。"""
+        pipe, spy = make_pipeline()
+        ctx = {"slots": {"quantity": 2, "address_id": "ADDR_1"}}
+        for q in ("M2 Ultra 64G/1T 一批 多少钱，什么时候能到",
+                  "M2 Ultra 64G/1T 0台 多少钱，什么时候能到"):
+            dec = pipe.understand(q, ctx)
+            with self.subTest(q=q):
+                self.assertEqual(dec.action, Action.CLARIFY)
+                self.assertEqual(dec.api_calls, [])
+                self.assertIn("quantity", dec.missing_slots)
+                self.assertNotIn("quantity", dec.slots,
+                                 "F2：扇出 pending 分支快照 quantity 须清除，"
+                                 "不得残留 slots 进入下游")
+                self.assertIn("F2", dec.notes)
+                self.assertIn("待澄清子集", dec.notes,
+                              "F2：原扇出备注不得被清除备注覆盖丢弃")
         self.assertEqual(spy.calls, [])
 
     def test_n3_route_implies_no_invalid_quantity_expression(self):

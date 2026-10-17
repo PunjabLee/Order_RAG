@@ -442,6 +442,9 @@ class Pipeline:
         product——refs[0] 以 SKU 前缀识别时仅写 sku；product 须经别名反查命中
         商品名才回填，否则留空（必填缺失 → 行 5 定向澄清），禁止携带 SKU id
         直接 ROUTE。
+
+        F3 整改（终轮评审）：别名反查回填另加 sku 一致性守卫——焦点 ref 与
+        快照 sku 错配时不回填（防跨实体错配 ROUTE），保持行 5 澄清兜底。
         """
         alias_matches = alias_matches or []
         slots = {}
@@ -464,9 +467,14 @@ class Pipeline:
                 if "sku" not in slots:
                     slots["sku"] = ref
                 if "product" not in slots:
-                    product_name = self._product_name_for_sku(ref)
-                    if product_name:
-                        slots["product"] = product_name
+                    # F3 整改（终轮评审）：焦点 ref 与快照 sku 错配时不得把
+                    # ref 的别名商品名回填进 slots——否则下游按 sku=快照值取价
+                    # 却播报 product=焦点别名，跨实体错配 ROUTE。仅当生效 sku
+                    # 即本焦点 ref 才回填；错配保持 product 留空→行 5 定向澄清。
+                    if slots.get("sku", ref) == ref:
+                        product_name = self._product_name_for_sku(ref)
+                        if product_name:
+                            slots["product"] = product_name
             elif "product" not in slots:
                 # 非 SKU id 形态（商品名/别名文本）→ 按 DD-3.3.1 原样继承 product
                 slots["product"] = ref
@@ -574,6 +582,17 @@ class Pipeline:
                     if s not in union:
                         union.append(s)
             dec.missing_slots = sorted(union)
+            # F2 整改（终轮评审）：N3 快照清除口径在扇出 pending 分支同样生效——
+            # 本轮非法/模糊数量表达命中任一参与意图必填/可带 quantity 时，
+            # dec.slots 携带的快照合法值须清除（对齐 _finalize N3 分支），
+            # 兑现“两路同检”承诺，不得残留 slots 随澄清结果进入下游。
+            if qty.ambiguous and qty.ambiguous_phrases:
+                stale = dec.slots.pop("quantity", None)
+                if stale is not None:
+                    dec.notes = ((dec.notes + "；") if dec.notes else "") + (
+                        "本轮数量表达非法/模糊（" + "、".join(qty.ambiguous_phrases)
+                        + "），快照 quantity=" + str(stale) + " 已清除并转待校验"
+                        "（终轮评审 F2，对齐 N3）")
             ambiguous = len(cands) > 1 and "sku" not in slots
             if ambiguous:
                 # 行 4 优先：点选澄清（options）
@@ -588,9 +607,11 @@ class Pipeline:
                     dict.fromkeys(t for chunk in texts for t in chunk.split()))
                 dec.signals = self._uniq(signals + [Signal.SLOT_MISSING])
             ready = [i for i in dec.multi_intents if i not in pending]
-            dec.notes = ("多意图扇出前置校验未通过（DD-3.1 行 3×行 4/5）→ 澄清；"
-                         "可执行子集=" + ("、".join(ready) if ready else "无") +
-                         "；待澄清子集=" + "、".join(pending))
+            fanout_note = ("多意图扇出前置校验未通过（DD-3.1 行 3×行 4/5）→ 澄清；"
+                           "可执行子集=" + ("、".join(ready) if ready else "无") +
+                           "；待澄清子集=" + "、".join(pending))
+            # F2：保留本分支早前写入的快照清除备注（终轮评审），不得被覆盖丢弃
+            dec.notes = (dec.notes + "；" + fanout_note) if dec.notes else fanout_note
             return dec
         dec.action = Action.FANOUT
         targets = []

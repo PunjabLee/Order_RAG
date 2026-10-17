@@ -49,8 +49,11 @@ class TestPositiveControl(unittest.TestCase):
         self.assertTrue(spy.calls)
 
     def test_fanout_records_union(self):
+        # R2 整改后语义：扇出需通过必填矩阵校验（quantity/address_id 由
+        # 上下文快照补全）；未通过时 api_calls 恒空、由澄清承接。
         pipe, spy = make()
-        dec = pipe.understand("M2 Ultra 64G/1T多少钱，什么时候能到")
+        ctx = {"slots": {"quantity": 2, "address_id": "ADDR_1"}}
+        dec = pipe.understand("M2 Ultra 64G/1T多少钱，什么时候能到", ctx)
         self.assertEqual(dec.action, Action.FANOUT)
         self.assertEqual(spy.calls, dec.api_calls)
         self.assertEqual(len(spy.calls), len(set(spy.calls)), "目标去重，无重复调用")

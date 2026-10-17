@@ -69,6 +69,62 @@ class TestRow1Coreference(unittest.TestCase):
         self.assertIn("product", dec.missing_slots)
         self.assertEqual(spy.calls, [])
 
+    def test_coref_no_evidence_escalates_to_llm(self):
+        """R1 验收：有指代信号+无继承证据+规则未命中 → 小模型/LLM 层不得被
+        旁路（DD-3.1 行 7『低置信→升级 LLM』结构性可达）。"""
+        llm = FakeLlmProvider([FakeLlmProvider.payload(
+            intent=cat.PRICE_QUERY, confidence=0.85,
+            entities={"product": "mac studio"})])
+        pipe, spy = make_pipeline(llm=llm)
+        dec = pipe.understand("它的保修是几年")
+        self.assertTrue(llm.calls, "无继承证据时必须继续调用 LLM 兜底层")
+        self.assertEqual(dec.layer, Layer.LLM)
+        self.assertEqual(dec.action, Action.ROUTE)
+        self.assertEqual(dec.slots.get("product"), "mac studio")
+        self.assertEqual(spy.calls, dec.api_calls)
+
+    def test_follow_up_three_layer_reachability(self):
+        """R1：『指代/省略+无规则命中+LLM 可用』路径下三层均可达——
+        规则层（有词表证据）/小模型层（≥conf_low 采纳）/LLM 层（升级）。"""
+        good_payload = FakeLlmProvider.payload(
+            intent=cat.PRICE_QUERY, confidence=0.85,
+            entities={"product": "mac studio"})
+        # (1) 规则层：指代信号 + 规则强命中 → 规则证据优先（原语义保持）
+        llm = FakeLlmProvider([good_payload])
+        pipe, _ = make_pipeline(llm=llm)
+        dec = pipe.understand("那款多少钱")
+        self.assertEqual(dec.layer, Layer.RULE)
+        self.assertEqual(dec.intent, cat.PRICE_QUERY)
+        # (2) 小模型层：无规则命中 + 无继承证据（无 last_intent）+ 快照补槽
+        small = FakeSmallModel({cat.PRICE_QUERY: CFG.conf_low})
+        llm2 = FakeLlmProvider([good_payload])
+        pipe2, _ = make_pipeline(small=small, llm=llm2)
+        dec2 = pipe2.understand("那个呢", {"slots": {"product": "mac studio"}})
+        self.assertEqual(dec2.layer, Layer.SMALL)
+        self.assertEqual(llm2.calls, [], "小模型达标不应耗 LLM")
+        # (3) LLM 层：小模型低置信 → 升级（行 7）
+        small3 = FakeSmallModel({cat.PRICE_QUERY: CFG.conf_oos + 0.1})
+        llm3 = FakeLlmProvider([good_payload])
+        pipe3, _ = make_pipeline(small=small3, llm=llm3)
+        dec3 = pipe3.understand("那个呢", {"slots": {"product": "mac studio"}})
+        self.assertEqual(dec3.layer, Layer.LLM)
+        self.assertTrue(llm3.calls)
+
+    def test_short_input_escalates_to_llm_when_available(self):
+        """R1（行 8）：极短输入无继承证据时仍先跑后续层；LLM 可用则由其裁决，
+        不可用才落降级链末端澄清（行 8 话术保持）。"""
+        llm = FakeLlmProvider([FakeLlmProvider.payload(
+            intent=cat.DELIVERY_QUERY, confidence=0.8,
+            entities={"product": "mac studio"})])
+        pipe, _ = make_pipeline(llm=llm)
+        dec = pipe.understand("嗯")
+        self.assertTrue(llm.calls)
+        self.assertEqual(dec.layer, Layer.LLM)
+        pipe2, _ = make_pipeline()                       # LLM 未接入
+        dec2 = pipe2.understand("嗯")
+        self.assertEqual(dec2.action, Action.CLARIFY)
+        self.assertEqual(dec2.template, CFG.template("clarify_short_input"))
+
     def test_resolution_algorithm_owner_is_it_2_03(self):
         """本轮仅最小可测继承：归属说明写进 notes，便于 IT-2.03 替换。"""
         pipe, _ = make_pipeline()
@@ -104,8 +160,15 @@ class TestRow3MultiIntent(unittest.TestCase):
     """行 3 多意图（≥2 只读意图）→ DAG 并行扇出声明（DD-3.5.3，执行属 IT-2.08）。"""
 
     def test_fanout_two_readonly_intents(self):
+        """行 3 扇出（R2 整改后语义）：必填矩阵/实体歧义**全部通过**才下发目标。
+
+        断言修正说明（评审 R2，DD-3.1 行 3×行 5）：原用例未给全 DELIVERY_QUERY
+        必填槽位（sku/quantity/address_id 中缺 quantity、address_id）也断言
+        FANOUT——这正是 R2 旁路。整改后必须经上下文快照补全必填，扇出方成立。
+        """
         pipe, spy = make_pipeline()
-        dec = pipe.understand("M2 Ultra 64G/1T多少钱，什么时候能到")
+        ctx = {"slots": {"quantity": 2, "address_id": "ADDR_1"}}
+        dec = pipe.understand("M2 Ultra 64G/1T多少钱，什么时候能到", ctx)
         self.assertEqual(dec.action, Action.FANOUT)
         self.assertEqual(Signal.MULTI_INTENT in dec.signals, True)
         self.assertEqual(set(dec.multi_intents),
@@ -128,6 +191,63 @@ class TestRow3MultiIntent(unittest.TestCase):
         self.assertNotIn(cat.OUT_OF_SCOPE, dec.multi_intents)
         self.assertNotIn(cat.ESCALATE_HUMAN, dec.multi_intents)
 
+    def test_fanout_blocked_by_required_matrix(self):
+        """R2 验收：『多少钱，什么时候到』零槽位 → 不得扇出（api_calls==[]），
+        缺必填意图转定向澄清（DD-3.1 行 3×行 5；US-007-S2 的真实含义是两问
+        都能查时才并行）。"""
+        pipe, spy = make_pipeline()
+        dec = pipe.understand("多少钱，什么时候到")
+        self.assertEqual(dec.action, Action.CLARIFY)
+        self.assertEqual(dec.api_calls, [])
+        self.assertEqual(spy.calls, [])
+        self.assertTrue(dec.missing_slots, "缺必填必须列明待澄清槽位")
+        self.assertIn("product", dec.missing_slots)        # PRICE_QUERY 必填
+        self.assertIn("address_id", dec.missing_slots)     # DELIVERY_QUERY 必填
+        self.assertEqual(set(dec.multi_intents),
+                         {cat.PRICE_QUERY, cat.DELIVERY_QUERY})
+        self.assertIn("可执行子集", dec.notes)
+        self.assertIn("待澄清子集", dec.notes)
+
+    def test_fanout_api_only_when_all_required_present(self):
+        """R2 不变式：fanout 且 api_calls 非空 ⇒ 每个参与意图必填已落槽、
+        且无未消解实体歧义（行 4 优先于行 3）。"""
+        pipe, spy = make_pipeline()
+        samples = (
+            ("多少钱，什么时候到", {}),
+            ("M2 Ultra 64G/1T多少钱，什么时候能到", {}),
+            ("M2 Ultra 64G/1T多少钱，什么时候能到",
+             {"slots": {"quantity": 2}}),
+            ("M2 Ultra 64G/1T多少钱，什么时候能到",
+             {"slots": {"quantity": 2, "address_id": "ADDR_1"}}),
+        )
+        for q, ctx in samples:
+            dec = pipe.understand(q, ctx or None)
+            with self.subTest(q=q, ctx=bool(ctx)):
+                if dec.action == Action.FANOUT and dec.api_calls:
+                    for it in dec.multi_intents:
+                        for s in cat.required_slots(it):
+                            self.assertTrue(dec.slots.get(s),
+                                            f"{it} 必填 {s} 未落槽仍扇出")
+                    self.assertNotIn(Signal.SKU_AMBIGUOUS, dec.signals,
+                                     "未消解歧义不得扇出")
+                    self.assertEqual(spy.calls, dec.api_calls)
+                else:
+                    self.assertEqual(dec.api_calls, [])
+
+    def test_fanout_multi_candidate_no_sku_guess_and_options(self):
+        """R3（扇出路径）：多候选别名不得静默取 cands[0]——api_calls 空、
+        slots 无任何 SKU 猜测值、options 点选（行 4 优先）。"""
+        pipe, spy = make_pipeline()
+        dec = pipe.understand("Ultra那款多少钱，什么时候能到")
+        self.assertEqual(dec.action, Action.CLARIFY)
+        self.assertEqual(dec.api_calls, [])
+        self.assertEqual(dec.options, ["SKU_A", "SKU_B", "SKU_D"])
+        self.assertEqual(spy.calls, [])
+        guessed = [v for v in dec.slots.values()
+                   if isinstance(v, str) and v.startswith("SKU_")]
+        self.assertEqual(guessed, [], "多候选不得把猜测 SKU 写入任何槽位")
+        self.assertIn("sku", dec.missing_slots)
+
 
 class TestRow4EntityAmbiguity(unittest.TestCase):
     """行 4 实体歧义（1→N SKU）→ clarification + options[] 点选（DD-7.3）。"""
@@ -138,6 +258,10 @@ class TestRow4EntityAmbiguity(unittest.TestCase):
         self.assertEqual(dec.action, Action.CLARIFY)
         self.assertEqual(dec.options, ["SKU_A", "SKU_B", "SKU_D"])
         self.assertEqual(dec.missing_slots, ["sku"])
+        # R3（单意图路径）：多候选时 slots 不含任何 SKU 猜测值
+        guessed = [v for v in dec.slots.values()
+                   if isinstance(v, str) and v.startswith("SKU_")]
+        self.assertEqual(guessed, [], "多候选禁止静默取 cands[0]（R3）")
         self.assertIn(Signal.SKU_AMBIGUOUS, dec.signals)
         self.assertEqual(dec.template,
                          CFG.template("clarify_sku_ambiguous").format(

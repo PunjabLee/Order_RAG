@@ -18,6 +18,14 @@
   7 低置信 0.4–0.6 → 升级 LLM；仍低 → 澄清
   8 极短输入 ≤3字  → 含焦点实体则继承，否则澄清
 
+合入前评审整改（IT-2.02 R1/R2/R3）：
+- R1：指代/省略/极短输入在无继承证据时**不再提前返回澄清**——小模型层与 LLM
+  兜底照常执行（行 7"低置信→升级 LLM"结构性可达），澄清下移为降级链末端；
+- R2：FANOUT 前对每个参与意图跑必填矩阵/1→N 实体歧义校验，未过 → 澄清
+  （可执行子集/待澄清子集记入 notes），未校验目标不得下发；
+- R3：_collect_slots 多候选禁止静默取 cands[0] 且不得把 SKU id 写入 product；
+  仅单候选且可映射商品名（命中别名）时回填。
+
 **零网络**：本模块只产出路由决策对象；API 调用由 IT-2.08 调用器执行，
 决策经 on_api_call sink 记录（OUT_OF_SCOPE/澄清/引导恒不触发，测试以 call-spy 断言）。
 """
@@ -178,7 +186,7 @@ class Pipeline:
         self.rule = RuleLayer(self.cfg)
         self.small_model = small_model
         self.llm = llm
-        # 指标回调：nlu.parse_fail（DD-11.2）；默认无操作
+        # 指标回调：nlu.parse_fail / nlu.llm_error / nlu.llm_not_wired（DD-11.2）；默认无操作
         self._on_parse_fail = on_parse_fail or (lambda event: None)
         # API 调用 sink：真实调用属 IT-2.08；本管线只声明+记账（call-spy 测试 US-007-S4）
         self._on_api_call = on_api_call
@@ -199,7 +207,6 @@ class Pipeline:
         # ---- 1. 规则/词表层（≥conf_rule_strong 直接路由） ----
         rule_labels = self.rule.classify(norm)
         best = rule_labels[0] if rule_labels else None
-        rule_strong_hit = best is not None and best.confidence >= cfg.conf_rule_strong
 
         # 决策表行 6/转接：领域外与转人工词表强/弱命中即短路
         # （US-007-S4：OUT_OF_SCOPE 处置＝引导话术，api_calls 恒空；
@@ -217,32 +224,23 @@ class Pipeline:
                 dec.template = cfg.template("escalate_ack")
                 return self._issue(dec)
 
-        slots = self._collect_slots(ctx, qty, cands, norm)
+        slots = self._collect_slots(ctx, qty, cands, norm, alias_matches)
         dec.slots = slots
 
-        # 决策表行 1/2/8：指代·省略·极短输入（无规则强命中时）→ 上下文继承或澄清。
-        # 消解算法本体属 IT-2.03（DD-3.2.4）；本轮按"栈顶焦点实体 + 上一轮意图"
-        # 做最小可测继承，消解证据不足时置信按 conf_coref_min 下限处置。
+        # 决策表行 1/2/8：指代·省略·极短输入（规则层证据不足时）→ 先尝试上下文继承。
+        # R1 整改（合入前评审）：无继承证据时**不再提前返回澄清**——小模型层与
+        # LLM 兜底必须继续执行，否则行 7"低置信→升级 LLM"结构性不可达；
+        # "澄清"下移为降级链末端（follow_up_clarify 标记由分层段末尾消费）。
         follow_up = (Signal.SHORT_INPUT in signals or Signal.COREF in signals
                      or Signal.ELLIPSIS in signals)
-        # 触发条件：指代/省略/极短 **且** 规则层意图证据不足（无命中或 <conf_low）；
-        # 规则层已有 ≥conf_low 的命中时按分层策略优先路由（行 1 的消解只补意图缺口）。
+        follow_up_clarify = False
         if follow_up and (best is None or best.confidence < cfg.conf_low):
             inherited = self._inherit_context(dec, slots, ctx, qty, cands, signals)
             if inherited is not None:
                 return inherited
-            if Signal.SHORT_INPUT in signals:
-                dec.action = Action.CLARIFY
-                dec.template = cfg.template("clarify_short_input")
-                dec.notes = "极短输入且无继承证据 → 澄清（DD-3.1 行 8）"
-                return self._issue(dec)
-            # 有指代/省略信号但无法确定继承意图 → 定向澄清（**不得**按领域外处置：
-            #   领域外需显式证据（词表命中或分类器置信分布），省略句本身是域内信号）
-            dec.action = Action.CLARIFY
-            dec.layer = Layer.FALLBACK
-            dec.template = cfg.template("clarify_generic")
-            dec.notes = "指代/省略且上下文无可继承证据 → 澄清（DD-3.1 行 1/2）"
-            return self._issue(dec)
+            follow_up_clarify = True
+            # 有指代/省略/极短信号但无法确定继承 → 继续走后续层；
+            # **不得**按领域外处置：省略/指代本身是域内信号（评审 R1）
 
         # 决策表行 4（模糊别名 1→N sku → 点选澄清）统一在 _finalize 处置，
         # 位于意图判定之后——LLM/小模型仍有机会给出意图，再行 options 澄清。
@@ -250,7 +248,8 @@ class Pipeline:
         if multi:
             signals.append(Signal.MULTI_INTENT)
             dec.signals = signals
-            return self._issue(self._fanout_decision(dec, multi, slots))
+            return self._issue(self._fanout_decision(dec, multi, slots, cands,
+                                                     qty, signals))
         if best is not None and best.confidence >= cfg.conf_rule_strong:
             dec.intent = best.intent
             dec.confidence = best.confidence
@@ -287,10 +286,11 @@ class Pipeline:
         signals.append(Signal.LOW_CONFIDENCE)
         dec.signals = signals
         if self.llm is None and best is None and small_best is None:
+            # 各层均无证据且 LLM 未接入 → 降级链末端澄清（行 7/8/1/2）。
             dec.action = Action.CLARIFY
             dec.layer = Layer.FALLBACK
-            dec.template = cfg.template("clarify_generic")
-            dec.notes = "各层均无证据且 LLM 未接入 → 澄清（行 7 降级链末端）"
+            dec.template, dec.notes = self._follow_up_fallback(
+                follow_up_clarify, signals)
             return self._issue(dec)
         llm_payload, llm_errors, attempts, fails = self._run_llm(norm, dec, small_best)
         dec.llm_attempts = attempts
@@ -301,13 +301,14 @@ class Pipeline:
                 dec.intent = small_best.intent
                 dec.confidence = small_best.confidence
                 dec.layer = Layer.SMALL
-                dec.notes = "LLM 解析失败（含重试）→ 降级小模型结果"
+                dec.notes = "LLM 未产出（解析/调用失败，含重试）→ 降级小模型结果"
                 return self._finalize(dec, slots, ctx, qty, cands, signals,
                                      ignore_llm_errors=True)
             dec.action = Action.CLARIFY
             dec.layer = Layer.FALLBACK
             dec.template = cfg.template("clarify_llm_fail")
-            dec.notes = "LLM 解析失败 → 降级小模型无果 → 模板澄清；parse_fail 已计" + str(fails)
+            dec.notes = ("LLM 未产出（解析/调用失败，含重试）→ 降级小模型无果 → 模板澄清；"
+                         "parse_fail 已计 " + str(fails))
             return self._issue(dec)
 
         intent = llm_payload["intent"]
@@ -329,13 +330,30 @@ class Pipeline:
                 llm_slots[k] = v
         return self._finalize(dec, llm_slots, ctx, qty, cands, signals)
 
+    def _follow_up_fallback(self, follow_up_clarify: bool, signals: list):
+        """降级链末端的澄清话术（R1：继承/澄清下移至各层跑完之后）。
+
+        返回 (template, notes)。省略/指代/极短为域内信号，恒不按领域外处置。
+        """
+        cfg = self.cfg
+        if follow_up_clarify and Signal.SHORT_INPUT in signals:
+            return (cfg.template("clarify_short_input"),
+                    "极短输入且无继承证据，各层均无证据 → 澄清（DD-3.1 行 8，降级链末端）")
+        if follow_up_clarify:
+            return (cfg.template("clarify_generic"),
+                    "指代/省略且上下文无可继承证据，各层均无证据 → 澄清"
+                    "（DD-3.1 行 1/2，降级链末端；域内信号不按领域外处置）")
+        return (cfg.template("clarify_generic"),
+                "各层均无证据且 LLM 未接入 → 澄清（行 7 降级链末端）")
+
     def _inherit_context(self, dec: Decision, slots: dict, ctx: dict,
                          qty: QuantityResult, cands: list, signals: list):
         """决策表行 1/2/8 的继承处置：上一轮意图 + 焦点实体/槽位快照。
 
-        返回 Decision 表示已处置；None 表示无继承证据（由调用方澄清）。
-        置信取配置 conf_coref_min（消解下限，默认＝conf_low＝0.6）：
-        证据＝焦点实体单值 **或** 会话快照已有槽位；两者皆无 → 不继承（禁猜测）。
+        返回 Decision 表示已处置；None 表示无继承证据（由调用方继续走后续层，
+        澄清移至降级链末端 —— 评审 R1）。置信取配置 conf_coref_min
+        （消解下限，默认＝conf_low＝0.6）：证据＝焦点实体单值 **或** 会话快照
+        已有槽位；两者皆无 → 不继承（禁猜测）。
         """
         cfg = self.cfg
         last_intent = ctx.get("last_intent")
@@ -382,8 +400,15 @@ class Pipeline:
         return signals
 
     def _collect_slots(self, ctx: dict, qty: QuantityResult, cands: list,
-                       norm: str = "") -> dict:
-        """槽位快照（DD-3.2 会话服务读侧）+ 归一化结果合并；只读、不校验（校验属 IT-2.04）。"""
+                       norm: str = "", alias_matches: list | None = None) -> dict:
+        """槽位快照（DD-3.2 会话服务读侧）+ 归一化结果合并；只读、不校验（校验属 IT-2.04）。
+
+        R3 整改（合入前评审）：多候选（1→N 实体歧义）**禁止**静默取 cands[0]，
+        也不得把 SKU id 写入 product——不回填 sku/product，交由 _finalize 出
+        options[] 点选；仅单候选且能映射到商品名（命中别名文本，DD-3.3.1
+        product 来源＝商品服务名称/别名索引）时才回填 product。
+        """
+        alias_matches = alias_matches or []
         slots = {}
         for name in cat.ALL_SLOTS + ("order_id",):
             v = (ctx.get("slots") or {}).get(name)
@@ -409,8 +434,12 @@ class Pipeline:
                     slots["product"] = term
                     break
             else:
-                if cands:
-                    slots["product"] = cands[0]  # 由 sku 粒度推定（DD-3.3.2 product ○ 注释）
+                if len(cands) == 1:
+                    # 单候选：以命中的**别名文本**（商品名形态）回填，不写 SKU id（R3）
+                    for m in alias_matches:
+                        if m.sku == cands[0] and m.alias:
+                            slots["product"] = m.alias
+                            break
         return slots
 
     def _rule_multi_intent(self, labels: list) -> list:
@@ -426,20 +455,79 @@ class Pipeline:
             return ro
         return []
 
-    def _fanout_decision(self, dec: Decision, labels: list, slots: dict) -> Decision:
-        """多意图 → DAG 并行扇出声明（DD-3.5.3，执行属 IT-2.08；预算 +200ms）。"""
-        dec.action = Action.FANOUT
+    def _required_missing(self, intent: str, slots: dict, cands: list,
+                          qty: QuantityResult) -> list:
+        """单意图必填矩阵（DD-3.3.2）＋1→N 实体歧义校验（评审 R2/R3）。
+
+        未消解的别名歧义（多候选且 sku 未落槽）按该意图涉及 sku 槽位记为
+        缺失『sku』；模糊量词（"一批"）按涉及 quantity 槽位记为缺失『quantity』。
+        """
+        missing = sorted(s for s in cat.required_slots(intent)
+                         if slots.get(s) in (None, ""))
+        relevant = cat.slots_of(intent)   # 该意图可携带的全部槽位（required∪optional）
+        if (len(cands) > 1 and "sku" not in slots and "sku" in relevant
+                and "sku" not in missing):
+            missing.append("sku")
+        if (qty.ambiguous and "quantity" in relevant and "quantity" not in missing
+                and slots.get("quantity") is None):
+            missing.append("quantity")
+        return missing
+
+    def _fanout_decision(self, dec: Decision, labels: list, slots: dict,
+                         cands: list, qty: QuantityResult,
+                         signals: list) -> Decision:
+        """多意图 → DAG 并行扇出声明（DD-3.5.3，执行属 IT-2.08；预算 +200ms）。
+
+        R2 整改（合入前评审）：行 3 扇出**不是豁免**——先对每个参与意图跑
+        必填矩阵/1→N 实体歧义校验（行 5/行 4）；任一意图缺必填或存在未消解
+        歧义 → 转 CLARIFY/options（api_calls 恒空，未校验目标不得下发），
+        可执行子集与待澄清子集记入 notes。全部通过才声明扇出。
+        """
         dec.layer = Layer.RULE
         dec.multi_intents = [l.intent for l in labels]
         dec.intent = labels[0].intent  # top（权重同则按目录优先级）
         dec.confidence = labels[0].confidence
+        pending = {}                       # 待澄清子集：intent → 缺失槽位
+        for l in labels:
+            miss = self._required_missing(l.intent, slots, cands, qty)
+            if miss:
+                pending[l.intent] = miss
+        if pending:
+            dec.action = Action.CLARIFY
+            dec.api_calls = []             # 硬约束：未过校验零下发
+            union = []
+            for miss in pending.values():
+                for s in miss:
+                    if s not in union:
+                        union.append(s)
+            dec.missing_slots = sorted(union)
+            ambiguous = len(cands) > 1 and "sku" not in slots
+            if ambiguous:
+                # 行 4 优先：点选澄清（options）
+                dec.options = list(cands)
+                dec.template = self.cfg.template("clarify_sku_ambiguous").format(
+                    options="、".join(cands))
+                dec.signals = self._uniq(signals + [Signal.SKU_AMBIGUOUS])
+            else:
+                texts = [self._slot_template(i, miss, qty)
+                         for i, miss in pending.items()]
+                dec.template = " ".join(
+                    dict.fromkeys(t for chunk in texts for t in chunk.split()))
+                dec.signals = self._uniq(signals + [Signal.SLOT_MISSING])
+            ready = [i for i in dec.multi_intents if i not in pending]
+            dec.notes = ("多意图扇出前置校验未通过（DD-3.1 行 3×行 4/5）→ 澄清；"
+                         "可执行子集=" + ("、".join(ready) if ready else "无") +
+                         "；待澄清子集=" + "、".join(pending))
+            return dec
+        dec.action = Action.FANOUT
         targets = []
         for l in labels:
             for t in cat.route_targets(l.intent):
                 if t not in targets:
                     targets.append(t)
         dec.api_calls = targets
-        dec.notes = "多意图 DAG 并行扇出（DD-3.1 行 3 / DD-3.5.3）"
+        dec.notes = ("多意图 DAG 并行扇出（DD-3.1 行 3 / DD-3.5.3）；"
+                     "各意图必填槽位与实体歧义校验全部通过（评审 R2）")
         return dec
 
     def _oos_decision(self, dec: Decision, signals: list, note: str) -> Decision:
@@ -474,7 +562,9 @@ class Pipeline:
     def _run_llm(self, norm: str, dec: Decision, small_best):
         """LLM 结构化输出：JSON 解析 + Schema 校验；失败重试 llm_retry_max → None。
 
-        每次解析/校验失败即时计入 nlu.parse_fail 回调（DD-11.2）。
+        指标口径（DD-3.1 L629，评审 R5）：**仅 JSON/Schema 解析失败**逐次计入
+        nlu.parse_fail；provider 未注入/调用异常/返回 None 属可用性事件
+        （nlu.llm_not_wired / nlu.llm_error），不混入 parse_fail。
         """
         cfg = self.cfg
         schema = build_nlu_schema()

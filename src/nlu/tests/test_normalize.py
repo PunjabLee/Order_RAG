@@ -17,7 +17,7 @@ from src.nlu.normalize import (
     sku_candidates,
 )
 
-CFG = load_config()
+CFG = load_config(env={})    # R14②：钉死隔离，禁读真实 os.environ
 
 
 class TestNormalizeText(unittest.TestCase):

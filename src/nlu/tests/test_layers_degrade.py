@@ -323,26 +323,113 @@ class TestHeuristicSmallModelBaseline(unittest.TestCase):
 
 
 class TestNoHardcodedThresholds(unittest.TestCase):
-    """阈值必须来自配置：AST 层面断言代码不含业务阈值浮点字面（注释/docstring 不算）。"""
+    """禁硬编码 **AST 白名单守卫**（评审 R7 改造；DD-16 R-07 / DD-3.1 阈值配置化）。
 
-    BANNED_FLOATS = {0.4, 0.6, 0.75, 0.9, 0.5}
+    旧黑名单（BANNED_FLOATS＝已知阈值枚举）可被绕过：把字面改成其它数值
+    （如 0.55）或新增未列入的阈值即逃逸。白名单口径反转——业务模块
+    （router/normalize/providers/schema/intents，**R7 起含 config.py**）内的
+    ast.Constant 数值字面仅允许显式豁免集，其余一律失败：
 
-    def _float_literals(self, fname):
+    - COMMON_ALLOWED＝0/1：概率闭界 [0,1]、循环/下标起点、最小计数下界
+      （DD-3.3.1 "1≤q" 为文档常数；业务阈值数值一律走 thresholds/scoring 配置）；
+    - MODULE_ALLOWED：逐模块补充的**结构/语言事实**（见行内注释，逐项注明理由）；
+    - STRUCTURAL_NAMES：模块级结构常量赋值（中文数字系统表 _CN_*、槽位矩阵
+      SLOT_MATRIX 等）整子树豁免——其数值是语言学/文档结构常量，非业务阈值。
+
+    自证（不入库）：临时向 router.py 注入 `best.confidence < 0.55` 字面后本类
+    两用例必须翻红——已按评审要求在临时副本验证后还原。
+    """
+
+    COMMON_ALLOWED = {0, 1}
+    MODULE_ALLOWED = {
+        "router.py": {2},        # 决策表行 3 结构定义：扇出＝"恰好两个只读意图"
+        "normalize.py": {2},     # 口语"俩"＝2（语言事实，DD-3.1 中文数字归一）
+        "providers.py": {2, 4},  # bigram 窗口＝2、打分取整 4 位（统计结构常量）
+        "schema.py": set(),      # 0/1 已覆盖（confidence [0,1]、quantity minimum 1）
+        "intents.py": set(),
+        "config.py": set(),      # 0/1 已覆盖（阈值区间校验的闭界 [0,1]）
+    }
+    STRUCTURAL_NAMES = {
+        "normalize.py": {"_CN_DIGIT", "_CN_UNIT", "_CN_SECTION"},
+        "intents.py": {"SLOT_MATRIX", "ROUTE_TARGETS"},
+        "config.py": {"REQUIRED_PATHS", "_ENV_THRESHOLD_MAP"},
+    }
+    MODULES = ("router.py", "normalize.py", "providers.py", "schema.py",
+               "intents.py", "config.py")
+
+    def _numeric_exemptions(self, fname, tree):
+        """模块级结构常量赋值子树内的数值节点 id 集合（显式豁免）。"""
         import ast
-        with open(os.path.join(NLU_DIR, fname), encoding="utf-8") as fh:
-            tree = ast.parse(fh.read(), filename=fname)
-        return {n.value for n in ast.walk(tree)
-                if isinstance(n, ast.Constant) and isinstance(n.value, float)}
+        exempt = set()
+        want = self.STRUCTURAL_NAMES.get(fname, set())
+        if not want:
+            return exempt
+        for node in tree.body:
+            targets, value = [], None
+            if isinstance(node, ast.Assign):
+                targets, value = node.targets, node.value
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                targets, value = [node.target], node.value
+            names = {t.id for t in targets if isinstance(t, ast.Name)}
+            if value is not None and names & want:
+                for c in ast.walk(value):
+                    if (isinstance(c, ast.Constant)
+                            and isinstance(c.value, (int, float))
+                            and not isinstance(c.value, bool)):
+                        exempt.add(id(c))
+        return exempt
 
-    def test_router_and_normalize_free_of_threshold_literals(self):
-        for fname in ("router.py", "normalize.py", "intents.py", "schema.py",
-                      "providers.py"):
-            hits = self._float_literals(fname) & self.BANNED_FLOATS
-            self.assertFalse(hits, f"{fname} 硬编码业务阈值字面 {sorted(hits)}")
+    def _offenders(self, fname):
+        """返回白名单之外的数值字面 [(行号, 值)]。"""
+        import ast
+        path = os.path.join(NLU_DIR, fname)
+        with open(path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename=fname)
+        allowed = set(self.COMMON_ALLOWED) | self.MODULE_ALLOWED.get(fname, set())
+        exempt = self._numeric_exemptions(fname, tree)
+        bad = []
+        for c in ast.walk(tree):
+            if id(c) in exempt:
+                continue
+            if (isinstance(c, ast.Constant)
+                    and isinstance(c.value, (int, float))
+                    and not isinstance(c.value, bool)
+                    and c.value not in allowed):
+                bad.append((c.lineno, c.value))
+        return bad
+
+    def test_business_modules_free_of_unexempted_numeric_literals(self):
+        for fname in self.MODULES:
+            bad = self._offenders(fname)
+            self.assertFalse(bad,
+                             f"{fname} 出现白名单外数值字面（行,值）：{bad}")
 
     def test_router_reads_thresholds_from_config(self):
-        with open(os.path.join(NLU_DIR, "router.py"), encoding="utf-8") as fh:
+        """R7 升级：由文本存在性 → AST 检查。判定处（Compare）比较右值不得为
+        白名单外数值字面——业务置信/重试/轮数阈值必须来自 cfg.*（DD-3.1）。"""
+        import ast
+        path = os.path.join(NLU_DIR, "router.py")
+        with open(path, encoding="utf-8") as fh:
             text = fh.read()
+        tree = ast.parse(text, filename="router.py")
+        allowed = set(self.COMMON_ALLOWED) | self.MODULE_ALLOWED["router.py"]
+        bad = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Compare):
+                continue
+            for comp in node.comparators:
+                v = comp
+                if (isinstance(v, ast.UnaryOp) and isinstance(v.op, ast.USub)
+                        and isinstance(v.operand, ast.Constant)):
+                    v = v.operand          # -1 与 1 同源判定
+                if (isinstance(v, ast.Constant)
+                        and isinstance(v.value, (int, float))
+                        and not isinstance(v.value, bool)
+                        and v.value not in allowed):
+                    bad.append((node.lineno, v.value))
+        self.assertFalse(bad,
+                         f"router 判定处比较右值含数值字面阈值（行,值）：{bad}")
+        # 文本存在性保留：防改名后 cfg 读取点整体消失而 AST 仍空转
         for name in ("conf_low", "conf_oos", "conf_rule_strong",
                      "conf_rule_weak", "llm_retry_max", "short_input_max_chars",
                      "complex_turn_threshold"):

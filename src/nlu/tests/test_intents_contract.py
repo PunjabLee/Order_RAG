@@ -88,7 +88,7 @@ class TestNoAmount(unittest.TestCase):
                 self.assertNotIn(anchor, code, f"{fname} 含夹具金额锚点 {anchor}")
 
     def test_no_amount_keys_in_defaults(self):
-        cfg = load_config()
+        cfg = load_config(env={})   # R14②：钉死隔离，禁读真实 os.environ
         text = _read(os.path.join("config", "nlu.defaults.json"))
 
         def walk(node, path=""):

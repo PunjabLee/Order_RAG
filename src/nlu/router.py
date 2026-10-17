@@ -450,7 +450,9 @@ class Pipeline:
         if len(labels) < 2:
             return []
         top_w = labels[0].weight
-        tied = [l for l in labels if abs(l.weight - top_w) < 1e-9
+        # 权重为配置标尺（scoring.rule_weight_*）同序累加值，同命中结构下浮点
+        # 等值确定（R7 守卫：不留 1e-9 容差字面，比较右值不得为数值字面）
+        tied = [l for l in labels if l.weight == top_w
                 and l.confidence >= self.cfg.conf_rule_strong]
         ro = [l for l in tied if l.is_readonly_route]
         if len(ro) == 2:

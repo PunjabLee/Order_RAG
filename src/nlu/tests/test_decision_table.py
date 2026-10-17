@@ -177,6 +177,20 @@ class TestRow1Coreference(unittest.TestCase):
         self.assertEqual(dec.action, Action.ROUTE)
         self.assertEqual(spy.calls, dec.api_calls)
 
+    def test_n5_focus_sku_case_insensitive_not_mismatch(self):
+        """N5 验收（F3 复核）：同一实体仅大小写差异（focus "sku_a" vs
+        快照 "SKU_A"）不得误判错配——一致性按 upper 规范化，与 N2 识别
+        口径齐，回填路径保持 ROUTE。"""
+        pipe, spy = make_pipeline()
+        dec = pipe.understand("多少钱", {
+            "focus_entity": {"ref": ["sku_a"]},
+            "last_intent": cat.PRICE_QUERY,
+            "slots": {"sku": "SKU_A", "quantity": 2}})
+        self.assertEqual(dec.slots.get("product"), first_alias_for_sku("SKU_A"),
+                         "N5：大小写等价不得被当错配拒绝回填")
+        self.assertEqual(dec.action, Action.ROUTE)
+        self.assertEqual(spy.calls, dec.api_calls)
+
     def test_coref_no_evidence_escalates_to_llm(self):
         """R1 验收：有指代信号+无继承证据+规则未命中 → 小模型/LLM 层不得被
         旁路（DD-3.1 行 7『低置信→升级 LLM』结构性可达）。"""

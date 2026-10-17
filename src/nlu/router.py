@@ -471,7 +471,10 @@ class Pipeline:
                     # ref 的别名商品名回填进 slots——否则下游按 sku=快照值取价
                     # 却播报 product=焦点别名，跨实体错配 ROUTE。仅当生效 sku
                     # 即本焦点 ref 才回填；错配保持 product 留空→行 5 定向澄清。
-                    if slots.get("sku", ref) == ref:
+                    # N5（复核评审）：一致性比较按 upper 规范化——与 ref 形态
+                    # 识别（upper().startswith）及 _product_name_for_sku 同口径，
+                    # 同一实体仅大小写差异不得误判错配。
+                    if str(slots.get("sku", ref)).strip().upper() == str(ref).strip().upper():
                         product_name = self._product_name_for_sku(ref)
                         if product_name:
                             slots["product"] = product_name

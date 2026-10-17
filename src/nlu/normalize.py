@@ -4,7 +4,7 @@
 - 中文数字：\"三台\"→3（含 十/百/千/万 组合、\"两\"\"俩\"口语、阿拉伯数字混写）；
 - 模糊量词：\"一批\"→触发数量澄清（决策表：数量不明确 → quantity 定向追问）；
 - 模糊型号别名：\"M2 Ultra 64G 1T\"→经 model_alias 表映射 sku
-  （别名表**配置化**：src/nlu/config/nlu.defaults.json#model_alias，
+  （别名表**配置化**：src/nlu/config_data/nlu.defaults.json#model_alias，
    真实别名随 Q1/商品服务联调回填，当前为 eval/fixtures SKU_A~D 占位，
    pending_question=Q7 —— 禁止在代码中硬编码别名，DD-16 R-07）。
 

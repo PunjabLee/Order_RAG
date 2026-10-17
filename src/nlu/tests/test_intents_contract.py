@@ -89,7 +89,7 @@ class TestNoAmount(unittest.TestCase):
 
     def test_no_amount_keys_in_defaults(self):
         cfg = load_config(env={})   # R14②：钉死隔离，禁读真实 os.environ
-        text = _read(os.path.join("config", "nlu.defaults.json"))
+        text = _read(os.path.join("config_data", "nlu.defaults.json"))
 
         def walk(node, path=""):
             if isinstance(node, dict):

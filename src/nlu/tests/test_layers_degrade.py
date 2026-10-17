@@ -288,7 +288,7 @@ class TestHeuristicSmallModelBaseline(unittest.TestCase):
 
     def _overlay(self, mutate) -> str:
         with open(os.path.join(os.path.dirname(os.path.dirname(
-                os.path.abspath(__file__))), "config", "nlu.defaults.json"),
+                os.path.abspath(__file__))), "config_data", "nlu.defaults.json"),
                   encoding="utf-8") as fh:
             data = json.load(fh)
         mutate(data)

@@ -3,7 +3,7 @@
 
 原则（参照 scripts/ci/pricing_baseline.json 的单源教训，评审 N3）：
 - **缺键即致命**：ConfigError，禁止静默兜底/默认漂移；
-- **单源**：默认值唯一来自 config/nlu.defaults.json（标准库无 yaml，取 JSON，
+- **单源**：默认值唯一来自 config_data/nlu.defaults.json（标准库无 yaml，取 JSON，
   任务卡允许自行取舍）；可用 env `NLU_CONFIG_FILE` 指向 JSON 做覆盖层（深合并）；
 - **env 数值覆盖**：NLU_CONF_LOW / NLU_CONF_RULE_STRONG / NLU_CONF_RULE_WEAK /
   NLU_CONF_OOS / NLU_SHORT_INPUT_MAX_CHARS / NLU_LLM_RETRY_MAX /
@@ -17,7 +17,7 @@ import os
 import re
 
 DEFAULTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "config", "nlu.defaults.json")
+                             "config_data", "nlu.defaults.json")
 
 # 必须存在且类型合法的键路径（缺任一 → ConfigError，禁静默兜底）
 REQUIRED_PATHS = (
